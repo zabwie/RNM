@@ -25,4 +25,4 @@ Response:  Hello, how are you feeling? up? I are busy how emotions are you, how 
 ```
 - I mean now that I look at it, it's not that good at all, but cmon, what can you expect from a 5 Million parameter model?
 
-- I'm also testing it on 50k samples from tinychat.jsonl dataset.
+- I'm also testing it on 50k samples from tinychat.jsonl dataset. I am planning to switch to rust after it gets to a point where it can be used for production or it's proven to be a masterpiece. Hell that might take a year, so buckle up.
