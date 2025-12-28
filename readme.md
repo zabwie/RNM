@@ -1,6 +1,6 @@
-# RNK
+# RNKM
 
-- RNK is a model idea that I've had for a while, and I finally got around to implementing it.
+- RNKM (Recursive Neuro-Knowledge Model) is a model idea that I've had for a while, and I finally got around to implementing it.
 - It's a recursive neuro-symbolic model that processes text through a series of steps:
     1. Chunk encoding (tokens → latent chunks)
     2. State-space processing (fast local + slow long-term memory)
