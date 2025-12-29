@@ -115,7 +115,105 @@ class Decoder(nn.Module):
         # Project to vocabulary
         logits = self.out_proj(output)
         
-        return logits, hidden
+    def forward(
+        self,
+        intent: torch.Tensor,
+        target_tokens: Optional[torch.Tensor] = None,
+        hidden: Optional[torch.Tensor] = None,
+        sampling_prob: float = 0.0
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        """
+        Predict logits for the sequence.
+        
+        Args:
+            intent: (batch, n_chunks, d_model) refined intent
+            target_tokens: (batch, seq_len) target tokens for teacher forcing
+            hidden: optional initial hidden state
+            sampling_prob: probability of using model prediction instead of target (0.0 = pure teacher forcing)
+            
+        Returns:
+            logits: (batch, seq_len, vocab_size)
+            hidden: final hidden state
+        """
+        batch_size, n_chunks, _ = intent.shape
+        seq_len = n_chunks * self.chunk_size
+        device = intent.device
+        
+        # Project intent
+        intent_cond = self.intent_proj(intent)  # (batch, n_chunks, d_hidden)
+        
+        # Expand intent to token level
+        intent_expanded = intent_cond.unsqueeze(2).expand(
+            -1, -1, self.chunk_size, -1
+        ).reshape(batch_size, seq_len, self.d_hidden)
+        
+        # Initialize hidden state
+        if hidden is None:
+            hidden = torch.zeros(
+                self.n_layers, batch_size, self.d_hidden,
+                device=device, dtype=intent.dtype
+            )
+
+        if target_tokens is not None and sampling_prob == 0.0:
+            # FAST PATH: Pure Teacher Forcing (process all at once)
+            target_tokens = target_tokens[:, :seq_len]
+            token_emb = self.embedding(target_tokens)
+            
+            # Concatenate token embeddings with intent conditioning
+            decoder_input = torch.cat([token_emb, intent_expanded], dim=-1)
+            
+            # Decode
+            output, hidden = self.gru(decoder_input, hidden)
+            logits = self.out_proj(output)
+            return logits, hidden
+            
+        elif target_tokens is not None and sampling_prob > 0.0:
+            # SLOW PATH: Scheduled Sampling (loop)
+            outputs = []
+            
+            # Start with first target token (usually BOS if padded or first word)
+            curr_input = target_tokens[:, 0]
+            
+            for t in range(seq_len):
+                # Embed current input
+                token_emb = self.embedding(curr_input).unsqueeze(1) # (batch, 1, d_model)
+                intent_t = intent_expanded[:, t:t+1, :]
+                
+                # GRU step
+                decoder_input = torch.cat([token_emb, intent_t], dim=-1)
+                output, hidden = self.gru(decoder_input, hidden)
+                
+                # Project to vocab
+                logit = self.out_proj(output) # (batch, 1, vocab)
+                outputs.append(logit)
+                
+                # Correctly handle next input selection
+                if t < seq_len - 1: # Prepare input for t+1
+                    # With probability sampling_prob, use model prediction
+                    # Else use ground truth target_tokens[:, t+1]
+                    use_model_pred = (torch.rand(batch_size, device=device) < sampling_prob)
+                    
+                    # Model prediction (greedy for stability during training)
+                    model_pred = logit.argmax(dim=-1).squeeze(1)
+                    ground_truth = target_tokens[:, t+1]
+                    
+                    # Mix inputs based on choice
+                    curr_input = torch.where(use_model_pred, model_pred, ground_truth)
+            
+            logits = torch.cat(outputs, dim=1)
+            return logits, hidden
+            
+        else:
+             # Generation case (should use generate function, but for completeness)
+             # Behave as if input is zeros
+             token_emb = torch.zeros(
+                batch_size, seq_len, self.d_model,
+                device=intent.device, dtype=intent.dtype
+            )
+             decoder_input = torch.cat([token_emb, intent_expanded], dim=-1)
+             output, hidden = self.gru(decoder_input, hidden)
+             logits = self.out_proj(output)
+             return logits, hidden
     
     def generate(
         self,
@@ -326,3 +424,161 @@ class Decoder(nn.Module):
             curr_token = next_token
         
         return torch.stack(generated, dim=1)
+
+    def generate_simple(
+        self,
+        intent: torch.Tensor,
+        context_tokens: torch.Tensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int = 50
+    ) -> torch.Tensor:
+        """
+        SIMPLE autoregressive generation - bypasses chunk alignment.
+        Uses mean-pooled intent as a single conditioning vector for all steps.
+        This proves generation works at the token level.
+        
+        Args:
+            intent: (batch, n_chunks, d_model) - will be mean-pooled
+            context_tokens: (batch, context_len) prompt tokens
+            max_new_tokens: number to generate
+            temperature: sampling temp
+            top_k: top-k sampling
+            
+        Returns:
+            tokens: (batch, max_new_tokens)
+        """
+        batch_size = intent.shape[0]
+        device = intent.device
+        
+        # Mean-pool intent across chunks → single vector per sample
+        intent_pooled = intent.mean(dim=1)  # (batch, d_model)
+        intent_cond = self.intent_proj(intent_pooled)  # (batch, d_hidden)
+        
+        # Initialize hidden state
+        hidden = torch.zeros(
+            self.n_layers, batch_size, self.d_hidden,
+            device=device, dtype=intent.dtype
+        )
+        
+        # Warmup: Process context tokens
+        for t in range(context_tokens.shape[1]):
+            token = context_tokens[:, t]
+            token_emb = self.embedding(token)  # (batch, d_model)
+            # Concat token + intent (same intent for all tokens)
+            decoder_input = torch.cat([token_emb, intent_cond], dim=-1).unsqueeze(1)  # (batch, 1, d_model+d_hidden)
+            _, hidden = self.gru(decoder_input, hidden)
+        
+        # Generate: Start from last context token
+        curr_token = context_tokens[:, -1]
+        generated = []
+        
+        for t in range(max_new_tokens):
+            token_emb = self.embedding(curr_token)
+            decoder_input = torch.cat([token_emb, intent_cond], dim=-1).unsqueeze(1)
+            
+            output, hidden = self.gru(decoder_input, hidden)
+            logits = self.out_proj(output).squeeze(1)  # (batch, vocab_size)
+            
+            # Temperature
+            logits = logits / max(temperature, 1e-8)
+            
+            # Top-k
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, min(top_k, logits.size(-1)))[0][:, -1:]
+                logits[indices_to_remove] = float('-inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            generated.append(next_token)
+            curr_token = next_token
+        
+        return torch.stack(generated, dim=1)
+
+    def generate_like_training(
+        self,
+        intent: torch.Tensor,
+        prompt_len: int,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int = 50
+    ) -> torch.Tensor:
+        """
+        Generate using the SAME forward pass as training.
+        
+        Creates a fake sequence [prompt_already_processed + BOS padding],
+        runs decoder.forward() to get logits, then samples autoregressively.
+        This eliminates exposure bias by matching training conditions exactly.
+        
+        Args:
+            intent: (batch, n_chunks, d_model) from SSM/HRM
+            prompt_len: Length of prompt (already processed in intent)
+            max_new_tokens: Number to generate
+            temperature: Sampling temperature
+            top_k: Top-k sampling
+            
+        Returns:
+            tokens: (batch, max_new_tokens)
+        """
+        batch_size = intent.shape[0]
+        n_chunks = intent.shape[1]
+        device = intent.device
+        
+        # Total sequence length matches training (chunk-aligned)
+        seq_len = n_chunks * self.chunk_size
+        
+        # Project intent (same as forward)
+        intent_cond = self.intent_proj(intent)  # (batch, n_chunks, d_hidden)
+        
+        # Expand intent to token level (same as forward)
+        intent_expanded = intent_cond.unsqueeze(2).expand(
+            -1, -1, self.chunk_size, -1
+        ).reshape(batch_size, seq_len, self.d_hidden)
+        
+        # Initialize hidden
+        hidden = torch.zeros(
+            self.n_layers, batch_size, self.d_hidden,
+            device=device, dtype=intent.dtype
+        )
+        
+        # Start with BOS token
+        bos_token = 2  # BOS token ID
+        curr_token = torch.full((batch_size,), bos_token, device=device, dtype=torch.long)
+        
+        generated = []
+        
+        # Generate autoregressively using same structure as forward
+        for t in range(min(max_new_tokens, seq_len)):
+            token_emb = self.embedding(curr_token).unsqueeze(1)  # (batch, 1, d_model)
+            intent_t = intent_expanded[:, t:t+1, :]  # (batch, 1, d_hidden)
+            
+            decoder_input = torch.cat([token_emb, intent_t], dim=-1)
+            output, hidden = self.gru(decoder_input, hidden)
+            logits = self.out_proj(output).squeeze(1)  # (batch, vocab_size)
+            
+            # Temperature scaling
+            logits = logits / max(temperature, 1e-8)
+            
+            # Top-k filtering
+            if top_k > 0:
+                topk_vals, _ = torch.topk(logits, min(top_k, logits.size(-1)))
+                threshold = topk_vals[:, -1:]
+                logits[logits < threshold] = float('-inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            
+            generated.append(next_token)
+            curr_token = next_token  # Feed back our own prediction
+            
+            # Stop at EOS
+            if (next_token == 3).all():  # EOS token
+                break
+        
+        if not generated:
+            return torch.zeros(batch_size, 1, device=device, dtype=torch.long)
+        
+        return torch.stack(generated, dim=1)
+

@@ -14,6 +14,7 @@ import os
 import json
 import math
 import time
+import re
 from pathlib import Path
 from typing import List, Optional, Tuple, Dict
 from dataclasses import dataclass
@@ -31,20 +32,37 @@ INTENT_MAP = {
     'question': 1,
     'fact': 2,  # Default
     'refusal': 3,
-    'opinion': 4
+    'opinion': 4,
+    'joke': 5
 }
 
-def classify_intent(text: str) -> int:
-    """Heuristic intent classification for supervision."""
-    text = text.lower()
-    if any(x in text for x in ["hi ", "hello", "hey", "greetings"]):
-        return INTENT_MAP['greeting']
-    if "?" in text or any(x in text for x in ["what", "how", "why", "when"]):
-        return INTENT_MAP['question']
-    if any(x in text for x in ["no ", "not ", "cannot", "don't", "stop"]):
+def classify_intent(text: str, prompt: str = "") -> int:
+    """Rigorous regex-based intent classification."""
+    text = text.lower().strip()
+    prompt = prompt.lower().strip()
+    
+    # 1. Joke (Highest Priority Override via Prompt)
+    if re.search(r'\b(joke|funny|laugh|pun)\b', prompt):
+        return INTENT_MAP['joke']
+        
+    # 2. Refusal (Negative sentiment)
+    if re.search(r'\b(no|not|cannot|can\'t|don\'t|stop|sorry|unable)\b', text):
         return INTENT_MAP['refusal']
-    if any(x in text for x in ["i think", "i feel", "believe", "opinion"]):
+
+    # 3. Greeting (Start of sentence/conversation)
+    # Strict anchor at start ^
+    if re.search(r'^(hello|hi|hey|greetings|good morning|good evening)\b', text):
+        return INTENT_MAP['greeting']
+    
+    # 4. Question (Ends with ? or starts with WH-word)
+    if "?" in text or re.search(r'^(what|why|how|when|where|who)\b', text):
+        return INTENT_MAP['question']
+        
+    # 5. Opinion (Subjective markers)
+    if re.search(r'\b(i think|i feel|believe|opinion|my view)\b', text):
         return INTENT_MAP['opinion']
+        
+    # 6. Fact (Default)
     return INTENT_MAP['fact']
 
 def classify_answerability(prompt: str, response: str) -> float:
@@ -97,6 +115,15 @@ def collate_fn(batch):
         
         # Pad sequences
         max_len = max(len(ids) for ids in input_ids)
+        
+        # Critical: Pad to chunk_size multiple (32)
+        # The encoder truncates to chunk boundaries. If we don't pad here, 
+        # the response (which starts after a boundary) might be truncated, 
+        # leading to 0 loss and no training.
+        chunk_size = 32 
+        if max_len % chunk_size != 0:
+            max_len = ((max_len // chunk_size) + 1) * chunk_size
+            
         padded_ids = torch.zeros(len(input_ids), max_len, dtype=torch.long)
         for i, ids in enumerate(input_ids):
             padded_ids[i, :len(ids)] = ids
@@ -138,7 +165,7 @@ class TrainConfig:
     model_size: str = "base"  # "small", "base", "large"
     
     # Training
-    batch_size: int = 16
+    batch_size: int = 512  # Optimized for GPU throughput
     epochs: int = 15
     learning_rate: float = 3e-4
     weight_decay: float = 0.01
@@ -209,7 +236,7 @@ class ConversationDataset(Dataset):
                 prompt_text = f"User: {inp}\nModel:"
                 full_text = f"{prompt_text} {out}"
                 
-                intent = classify_intent(out)
+                intent = classify_intent(out, prompt=inp)
                 answerable = classify_answerability(inp, out)
                 
                 # Track prompt end (Prediction Point)
@@ -326,6 +353,34 @@ class Trainer:
         # Mixed Precision
         self.scaler = torch.cuda.amp.GradScaler(enabled=(self.device.type == 'cuda'))
     
+    def _cleanup(self):
+        """Free RAM and VRAM after training."""
+        import gc
+        
+        print("Cleaning up memory...")
+        
+        # Delete large objects
+        if hasattr(self, 'model'):
+            del self.model
+        if hasattr(self, 'optimizer'):
+            del self.optimizer
+        if hasattr(self, 'train_loader'):
+            del self.train_loader
+        if hasattr(self, 'val_loader'):
+            del self.val_loader
+        if hasattr(self, 'scaler'):
+            del self.scaler
+        
+        # Force garbage collection
+        gc.collect()
+        
+        # Free CUDA memory
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            torch.cuda.synchronize()
+        
+        print("Memory cleanup complete.")
+    
     def _init_tokenizer(self) -> RNKTokenizer:
         """Initialize or load tokenizer."""
         tokenizer = RNKTokenizer(vocab_size=2048)
@@ -425,14 +480,18 @@ class Trainer:
                 train_dataset,
                 batch_size=self.config.batch_size,
                 shuffle=True,
-                num_workers=0,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True,
                 collate_fn=collate_fn
             )
             self.val_loader = DataLoader(
                 val_dataset,
                 batch_size=self.config.batch_size,
                 shuffle=False,
-                num_workers=0,
+                num_workers=4,
+                pin_memory=True,
+                persistent_workers=True,
                 collate_fn=collate_fn
             )
             print(f"Auto-split data: {train_size} train, {val_size} val")
@@ -447,7 +506,17 @@ class Trainer:
         total_loss = 0
         n_batches = 0
         
-        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
+        # Scheduled Sampling: Linear ramp from 0.0 to 0.5 after warmup
+        # Conservative schedule to prevent model from collapsing on own errors
+        k = 0.5  # Max sampling probability
+        warmup = 5 # Epochs of pure teacher forcing
+        if epoch < warmup:
+            sampling_prob = 0.0
+        else:
+            progress = min(1.0, (epoch - warmup) / max(1, self.config.epochs - warmup))
+            sampling_prob = k * progress
+            
+        pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} (p={sampling_prob:.2f})")
         
         for batch in pbar:
             # Handle new dict batch
@@ -474,7 +543,8 @@ class Trainer:
                     target_ids=input_ids,
                     target_intent=target_intent,
                     target_answerable=target_answerable,
-                    split_indices=split_idx
+                    split_indices=split_idx,
+                    sampling_prob=sampling_prob
                 )
                 loss = result['loss']
             
@@ -503,8 +573,12 @@ class Trainer:
                 desc += f" (int: {result['intent_loss']:.3f})"
             if 'answerable_loss' in result:
                 desc += f" (ans: {result['answerable_loss']:.3f})"
+            if 'latent_loss' in result:
+                desc += f" (lat: {result['latent_loss']:.3f})"
             if 'contrastive_loss' in result:
                 desc += f" (con: {result['contrastive_loss']:.3f})"
+            if 'relevance_loss' in result:
+                desc += f" (rel: {result['relevance_loss']:.3f})"
             pbar.set_postfix_str(desc)
         
         avg_loss = total_loss / n_batches
@@ -613,6 +687,9 @@ class Trainer:
         
         # Save final model
         self.save_checkpoint(self.config.epochs - 1, val_loss)
+        
+        # Memory cleanup - free RAM and VRAM
+        self._cleanup()
     
     @torch.no_grad()
     def generate_sample(self, prompt: str, max_tokens: int = 64) -> str:
@@ -649,7 +726,7 @@ def main():
     parser.add_argument("--val", type=str, default=None, help="Validation data path")
     parser.add_argument("--size", type=str, default="base", choices=["small", "base", "large"])
     parser.add_argument("--epochs", type=int, default=15)
-    parser.add_argument("--batch", type=int, default=16)
+    parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=100000, help="Limit training samples")
