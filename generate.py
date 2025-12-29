@@ -87,8 +87,9 @@ def interactive_generate(
             print("  [Context reset]")
             continue
         
-        # Encode prompt
-        input_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        # Encode prompt with structure
+        full_prompt = f"User: {prompt}\nModel:"
+        input_ids = tokenizer.encode(full_prompt, add_special_tokens=True)
         input_ids = torch.tensor([input_ids], device=device)
         
         # Generate
@@ -129,11 +130,12 @@ def batch_generate(
     responses = []
     
     for prompt in prompts:
-        input_ids = tokenizer.encode(prompt, add_special_tokens=True)
+        full_prompt = f"User: {prompt}\nModel:"
+        input_ids = tokenizer.encode(full_prompt, add_special_tokens=True)
         input_ids = torch.tensor([input_ids], device=device)
         
         with torch.no_grad():
-            output_ids, stop_probs = model.generate(
+            output_ids, stop_probs, answerable_prob = model.generate(
                 input_ids,
                 max_new_tokens=max_tokens,
                 temperature=temperature,
@@ -141,10 +143,23 @@ def batch_generate(
                 top_p=top_p
             )
         
+        # Answerability Gate Check
+        if answerable_prob.item() < 0.5:
+            # Model predicts it can't answer confidently
+            responses.append("[Model indicates low confidence - may not have sufficient knowledge to answer this question]")
+            continue
+            
+        if output_ids.dim() == 1:
+            output_ids = output_ids.unsqueeze(0)
+        
         # Check for stop signal
         # stop_probs is (batch, n_chunks)
         # Find first chunk where p(stop) > 0.5
         stop_mask = (stop_probs > 0.5).float()
+        
+        if stop_mask.dim() == 1:
+            stop_mask = stop_mask.unsqueeze(0)
+        
         stop_indices = torch.argmax(stop_mask, dim=1)
         
         # If any stop detected (argmax returns 0 if all 0, so check value)
@@ -156,7 +171,7 @@ def batch_generate(
             # So we keep that chunk.
             tokens_to_keep = (stop_idx + 1) * model.config.chunk_size
             output_ids = output_ids[:, :tokens_to_keep]
-        
+
         response = tokenizer.decode(output_ids[0].tolist())
         responses.append(response)
     

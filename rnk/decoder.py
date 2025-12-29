@@ -220,3 +220,109 @@ class Decoder(nn.Module):
     def init_hidden(self, batch_size: int, device: torch.device) -> torch.Tensor:
         """Initialize decoder hidden state."""
         return torch.zeros(self.n_layers, batch_size, self.d_hidden, device=device)
+
+    def generate_with_context(
+        self,
+        intent: torch.Tensor,
+        context_tokens: torch.Tensor,
+        max_new_tokens: int = 32,
+        temperature: float = 1.0,
+        top_k: int = 50,
+        top_p: float = 0.9
+    ) -> torch.Tensor:
+        """
+        Generate tokens conditioned on both intent AND context tokens.
+        
+        First "warms up" the GRU hidden state by processing context tokens,
+        then generates new tokens from that warmed-up state.
+        This ensures the output is contextually bound to the prompt.
+        
+        Args:
+            intent: (batch, n_chunks, d_model) refined intent
+            context_tokens: (batch, context_len) the prompt tokens
+            max_new_tokens: number of new tokens to generate
+            temperature: sampling temperature
+            top_k: top-k filtering
+            top_p: nucleus sampling threshold
+            
+        Returns:
+            tokens: (batch, max_new_tokens) generated token IDs
+        """
+        batch_size = intent.shape[0]
+        device = intent.device
+        context_len = context_tokens.shape[1]
+        
+        # Project intent
+        intent_cond = self.intent_proj(intent)  # (batch, n_chunks, d_hidden)
+        
+        # Expand intent to cover context + generation tokens
+        total_len = context_len + max_new_tokens
+        n_chunks = intent.shape[1]
+        tokens_from_intent = n_chunks * self.chunk_size
+        
+        if total_len <= tokens_from_intent:
+            intent_expanded = intent_cond.unsqueeze(2).expand(
+                -1, -1, self.chunk_size, -1
+            ).reshape(batch_size, tokens_from_intent, self.d_hidden)[:, :total_len, :]
+        else:
+            intent_expanded = intent_cond.unsqueeze(2).expand(
+                -1, -1, self.chunk_size, -1
+            ).reshape(batch_size, tokens_from_intent, self.d_hidden)
+            extra_needed = total_len - tokens_from_intent
+            last_intent = intent_cond[:, -1:, :].expand(-1, extra_needed, -1)
+            intent_expanded = torch.cat([intent_expanded, last_intent], dim=1)
+        
+        # Initialize hidden state
+        hidden = torch.zeros(
+            self.n_layers, batch_size, self.d_hidden,
+            device=device, dtype=intent.dtype
+        )
+        
+        # PHASE 1: Warmup on context tokens (teacher forcing)
+        for t in range(context_len):
+            token = context_tokens[:, t]
+            token_emb = self.embedding(token).unsqueeze(1)  # (batch, 1, d_model)
+            intent_t = intent_expanded[:, t:t+1, :]  # (batch, 1, d_hidden)
+            decoder_input = torch.cat([token_emb, intent_t], dim=-1)
+            _, hidden = self.gru(decoder_input, hidden)
+        
+        # PHASE 2: Generate new tokens autoregressively
+        # Start with the last context token
+        curr_token = context_tokens[:, -1]
+        generated = []
+        
+        for t in range(max_new_tokens):
+            token_emb = self.embedding(curr_token).unsqueeze(1)
+            intent_t = intent_expanded[:, context_len + t:context_len + t + 1, :]
+            decoder_input = torch.cat([token_emb, intent_t], dim=-1)
+            
+            output, hidden = self.gru(decoder_input, hidden)
+            logits = self.out_proj(output).squeeze(1)  # (batch, vocab_size)
+            
+            # Apply temperature
+            logits = logits / temperature
+            
+            # Top-k filtering
+            if top_k > 0:
+                indices_to_remove = logits < torch.topk(logits, top_k)[0][:, -1:]
+                logits[indices_to_remove] = float('-inf')
+            
+            # Top-p filtering
+            if top_p < 1.0:
+                sorted_logits, sorted_indices = torch.sort(logits, descending=True)
+                cumulative_probs = torch.cumsum(F.softmax(sorted_logits, dim=-1), dim=-1)
+                sorted_indices_to_remove = cumulative_probs > top_p
+                sorted_indices_to_remove[:, 1:] = sorted_indices_to_remove[:, :-1].clone()
+                sorted_indices_to_remove[:, 0] = False
+                indices_to_remove = sorted_indices_to_remove.scatter(
+                    1, sorted_indices, sorted_indices_to_remove
+                )
+                logits[indices_to_remove] = float('-inf')
+            
+            # Sample
+            probs = F.softmax(logits, dim=-1)
+            next_token = torch.multinomial(probs, num_samples=1).squeeze(-1)
+            generated.append(next_token)
+            curr_token = next_token
+        
+        return torch.stack(generated, dim=1)

@@ -1,28 +1,135 @@
-# RNKM
+# RNK - Recursive Neuro-Knowledge Model
 
-- RNKM (Recursive Neuro-Knowledge Model) is a model idea that I've had for a while, and I finally got around to implementing it.
-- It's a recursive neuro-symbolic model that processes text through a series of steps:
-    1. Chunk encoding (tokens → latent chunks)
-    2. State-space processing (fast local + slow long-term memory)
-    3. Hierarchical reasoning (abstract pattern extraction)
-    4. Neuro-symbolic refinement (constraint correction)
-    5. Decoding (latent → tokens)
-- The key insight: each chunk is "thought through" via HRM+NS
-    before decoding, giving coherence through planning rather than
-    pure autoregression.
-- This is the best model I've made so far, and I'm excited to see where it goes. Currently, it's at it's peak until I add some 'theorized' features to it. (Well not really theorized since some has been proven, but adding these will change the model completely.)
-- Also, it's not that good, but at only 5 Million parameters, the model can stay a tiny bit on par with the conversation:
+A **6M parameter** language model that achieves coherent conversation through **latent planning** rather than pure autoregression. No self-attention, O(n) complexity.
+
+## Core Idea
+
+Most language models predict the next token directly. RNK takes a different approach:
+
+1. **Chunk** the input into 32-token blocks
+2. **Plan** each chunk in a compressed latent space (HRM)
+3. **Refine** the plan through symbolic constraints (NS Refiner)
+4. **Decode** the refined intent back to tokens
+
+This means the model "thinks before it speaks" - each response is shaped by high-level intent, not just token-by-token prediction.
+
+## Architecture
 
 ```
-Prompt: What color is the sky?
-Response:  What is your favorite color that the wind? Sun is the sun? What
+Input Tokens
+     │
+     ▼
+┌─────────────┐
+│   Encoder   │  Chunks tokens → latent vectors (32 tok/chunk)
+└──────┬──────┘
+       │
+       ▼
+┌─────────────┐
+│     SSM     │  State Space Model (fast + slow memory)
+└──────┬──────┘
+       │
+  ┌────┴────┐
+  │         │
+  ▼         ▼
+┌──────┐  ┌──────────┐
+│Intent│  │   HRM    │  Hierarchical Reasoning (5-step planning)
+│ Head │  └────┬─────┘
+└──┬───┘       │
+   │           ▼
+   │    ┌────────────┐
+   │    │ NS Refiner │  Neuro-Symbolic refinement
+   │    └─────┬──────┘
+   │          │
+   │    ┌─────┴─────┐
+   ▼    ▼           ▼
+┌──────────┐  ┌──────┐  ┌─────────┐
+│Answerable│  │ Stop │  │ Decoder │
+│   Head   │  │ Head │  │  (GRU)  │
+└──────────┘  └──────┘  └────┬────┘
+                             │
+                             ▼
+                       Output Tokens
+```
 
-Prompt: Hello
-Response:  Hello your young happiness as life abadain interons easily. life bother
+### Components
 
+| Module | Size | Purpose |
+|--------|------|---------|
+| Encoder | 524K | 32-token chunks → 256-dim latent |
+| SSM | 1.98M | Dual memory (fast GRU + slow accumulator) |
+| HRM | 857K | Multi-step planning in latent space |
+| NS Refiner | 659K | Symbolic constraint layer |
+| Decoder | 2.17M | GRU with intent conditioning |
+
+### Auxiliary Heads
+
+| Head | Type | Purpose |
+|------|------|---------|
+| **Intent** | 5-class | greeting / question / fact / refusal / opinion |
+| **Answerable** | Binary | "Can I answer this?" gate (prevents hallucination) |
+| **Stop** | Binary | Per-chunk termination signal |
+
+## Training
+
+### Loss Function
+```
+Total = Token + 0.5×Stop + 0.2×Intent + 0.3×Answerable + 0.1×Contrastive
+```
+
+### Key Training Innovations
+
+1. **Causal Intent Prediction** - Intent is predicted from prompt-only state, preventing data leakage
+2. **Role Separation** - Strict `User:` / `Model:` formatting for instruction-following
+3. **Masked Response Loss** - Loss computed only on response tokens, not prompt
+4. **Boundary Padding** - Prompts padded to chunk boundaries for clean separation
+
+### Usage
+
+```bash
+# Train
+python train.py --train data/alpaca.jsonl --epochs 15
+
+# Generate
+python generate.py --prompt "What is the capital of France?"
+```
+
+## Current Status
+
+- **Parameters**: 6.19M
+- **Architecture**: Stable ✓
+- **Training**: Working ✓
+- **Q→A Binding**: In progress (training on Alpaca dataset)
+
+### Sample Output (pre-Alpaca)
+```
 Prompt: Hello, how are you?
-Response:  Hello, how are you feeling? up? I are busy how emotions are you, how are you?? time are fun when you are?
+Response: I am glad to hear that, sharing helps with yourself and understanding...
 ```
-- I mean now that I look at it, it's not that good at all, but cmon, what can you expect from a 5 Million parameter model?
+*Generic but grammatical - needs Q→A data to learn instruction-following.*
 
-- I'm also testing it on 50k samples from tinychat.jsonl dataset. I am planning to switch to rust after it gets to a point where it can be used for production or it's proven to be a masterpiece. Hell that might take a year, so buckle up.
+## Roadmap
+
+- [x] Intent Head (5-class classification)
+- [x] Answerability Gate (hallucination prevention)
+- [x] Stop Head (knows when to finish)
+- [x] Contrastive Loss (prompt-response binding)
+- [x] Role Separation (User/Model format)
+- [ ] Train on instruction-following data (Alpaca)
+- [ ] Evaluate Q→A accuracy
+- [ ] Scale to 20-30M params (if architecture proves out)
+
+## Design Philosophy
+
+> "O(n) complexity, no attention, but with the coherence of planning."
+
+RNK bets on **latent reasoning** over **pattern matching**. Instead of learning token co-occurrences, it learns:
+- What kind of response is expected (Intent)
+- Whether it can answer confidently (Answerability)
+- When to stop talking (Stop)
+- How to plan multi-step responses (HRM)
+
+This is closer to how humans structure responses: think first, then speak.
+
+## License
+
+Do whatever you want with it. If it works, tell me. If it doesn't, also tell me.

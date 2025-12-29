@@ -25,6 +25,101 @@ from torch.optim import AdamW
 from torch.optim.lr_scheduler import CosineAnnealingLR
 from tqdm import tqdm
 
+# Intent Definitions
+INTENT_MAP = {
+    'greeting': 0,
+    'question': 1,
+    'fact': 2,  # Default
+    'refusal': 3,
+    'opinion': 4
+}
+
+def classify_intent(text: str) -> int:
+    """Heuristic intent classification for supervision."""
+    text = text.lower()
+    if any(x in text for x in ["hi ", "hello", "hey", "greetings"]):
+        return INTENT_MAP['greeting']
+    if "?" in text or any(x in text for x in ["what", "how", "why", "when"]):
+        return INTENT_MAP['question']
+    if any(x in text for x in ["no ", "not ", "cannot", "don't", "stop"]):
+        return INTENT_MAP['refusal']
+    if any(x in text for x in ["i think", "i feel", "believe", "opinion"]):
+        return INTENT_MAP['opinion']
+    return INTENT_MAP['fact']
+
+def classify_answerability(prompt: str, response: str) -> float:
+    """
+    Heuristic answerability classification.
+    
+    Returns:
+        1.0 = answerable (factual, direct, concrete)
+        0.0 = not answerable / should refuse
+    """
+    prompt = prompt.lower()
+    response = response.lower()
+    
+    # Unanswerable patterns (should refuse)
+    unanswerable_keywords = [
+        "i don't know", "i'm not sure", "uncertain",
+        "sorry", "apologize", "unfortunately",
+        "cannot", "can't help", "unable to"
+    ]
+    if any(kw in response for kw in unanswerable_keywords):
+        return 0.0
+    
+    # Answerable patterns (factual questions with short direct answers)
+    if "?" in prompt:
+        # Check for direct answer length (short = likely answerable)
+        response_words = len(response.split())
+        if response_words < 50:  # Short, direct answer
+            return 1.0
+    
+    # Greetings are "answerable" (model can greet back)
+    greeting_words = ["hi", "hello", "hey", "good morning", "good evening"]
+    if any(g in prompt for g in greeting_words):
+        return 1.0
+    
+    # Default: treat as answerable (most chat is)
+    return 1.0
+
+def collate_fn(batch):
+    """Custom collate function for mixed data types."""
+    if len(batch) == 0:
+        return torch.tensor([])
+        
+    elem = batch[0]
+    if isinstance(elem, dict):
+        # Dict batch (ConversationDataset)
+        input_ids = [b['input_ids'] for b in batch]
+        intents = torch.stack([b['intent'] for b in batch])
+        split_indices = torch.stack([b['split_idx'] for b in batch])
+        answerabilities = torch.stack([b['answerable'] for b in batch])
+        
+        # Pad sequences
+        max_len = max(len(ids) for ids in input_ids)
+        padded_ids = torch.zeros(len(input_ids), max_len, dtype=torch.long)
+        for i, ids in enumerate(input_ids):
+            padded_ids[i, :len(ids)] = ids
+            
+        return {
+            'input_ids': padded_ids.to(intents.device), 
+            'intent': intents,
+            'split_idx': split_indices,
+            'answerable': answerabilities
+        }
+    elif isinstance(elem, torch.Tensor):
+        # Tensor batch (TextDataset)
+        # Pad sequences manually if variable length, or use default logical alignment
+        # TextDataset already pads to max_len inside __init__?
+        # TextDataset.__init__ does pad, but to `max_len`. 
+        # But if we want dynamic batching, we should pad here.
+        # But TextDataset produced fixed length tensors?
+        # Line 81: `tokenizer.encode(..., padding=True)` pads to `max_length=max_len`?
+        # Yes. So Tensors are same size.
+        return torch.stack(batch)
+    
+    return torch.utils.data.dataloader.default_collate(batch)
+
 from rnk import RNK
 from rnk.model import RNKConfig
 from rnk.tokenizer import RNKTokenizer
@@ -101,19 +196,74 @@ class ConversationDataset(Dataset):
         self.tokenizer = tokenizer
         self.max_len = max_len
         
-        self.samples = []
-        for inp, out in conversations:
-            # Encode input and output together
-            combined = f"{inp} {out}"
-            ids = tokenizer.encode(combined, max_length=max_len, padding=True)
+        self.encodings = []
+        self.intents = []
+        self.split_indices = []
+        self.answerabilities = []  # Answerability Gate labels
+        
+        for item in conversations:
+            if isinstance(item, (tuple, list)) and len(item) >= 2:
+                inp, out = item
+                # Format: "User: <inp>\nModel: <out>"
+                # This enforces Q->A structure and role separation
+                prompt_text = f"User: {inp}\nModel:"
+                full_text = f"{prompt_text} {out}"
+                
+                intent = classify_intent(out)
+                answerable = classify_answerability(inp, out)
+                
+                # Track prompt end (Prediction Point)
+                prompt_enc = tokenizer.encode(prompt_text, padding=False)
+                
+                # Boundary Padding: Pad prompt to chunk boundary (32)
+                # This ensures the Prompt ends exactly at a chunk limit
+                # So Intent(Prompt Chunk) -> Predicts(Response Chunk)
+                chunk_size = 32 # Default RNK chunk size
+                pad_len = (chunk_size - len(prompt_enc) % chunk_size) % chunk_size
+                if pad_len > 0:
+                    prompt_enc = prompt_enc + [0] * pad_len
+                
+                split_idx = len(prompt_enc)
+                
+                # Encode response and combine
+                # Note: We encode separately to preserve boundary, then concat
+                # Space before output is implicit in previous structure but let's be explicit
+                response_enc = tokenizer.encode(f" {out}", padding=False)
+                ids = prompt_enc + response_enc
+            else:
+                full_text = str(item)
+                intent = INTENT_MAP['fact']
+                answerable = 1.0  # Default answerable
+                split_idx = 0
+                ids = tokenizer.encode(full_text, max_length=self.max_len, padding=False)
+            # Wait, `collate_fn` handles padding now.
+            # But line 108 had `padding=True`.
+            # If we switch to dynamic padding, we save memory.
+            # Let's keep `padding=True` logic for consistency unless I changed TextDataset.
+            # I can't change TextDataset easily in replace_file.
+            # So I will just stick to fixed padding to `max_len` logic if possible, or use collate pad.
+            # My `collate_fn` implements padding.
+            # So I should disable padding here.
+            
             if len(ids) >= 16:
-                self.samples.append(ids)
+                if len(ids) > max_len:
+                    ids = ids[:max_len]
+                    if split_idx >= max_len: split_idx = max_len - 1
+                self.encodings.append(torch.tensor(ids, dtype=torch.long))
+                self.intents.append(torch.tensor(intent, dtype=torch.long))
+                self.split_indices.append(torch.tensor(split_idx, dtype=torch.long))
+                self.answerabilities.append(torch.tensor(answerable, dtype=torch.float))
     
     def __len__(self) -> int:
-        return len(self.samples)
+        return len(self.encodings)
     
-    def __getitem__(self, idx: int) -> torch.Tensor:
-        return torch.tensor(self.samples[idx], dtype=torch.long)
+    def __getitem__(self, idx: int) -> Dict[str, torch.Tensor]:
+        return {
+            'input_ids': self.encodings[idx],
+            'intent': self.intents[idx],
+            'split_idx': self.split_indices[idx],
+            'answerable': self.answerabilities[idx]
+        }
 
 
 def load_texts_from_file(path: str) -> List[str]:
@@ -160,7 +310,8 @@ class Trainer:
         self.optimizer = AdamW(
             self.model.parameters(),
             lr=config.learning_rate,
-            weight_decay=config.weight_decay
+            weight_decay=config.weight_decay,
+            fused=(self.device.type == 'cuda')
         )
         
         # Data
@@ -231,7 +382,8 @@ class Trainer:
                 d_model=256,
                 d_hidden=512,
                 n_hrm_layers=3,
-                n_fast_layers=2,
+                n_fast_layers=3,  # Increased
+                n_memory_slots=16, # Increased
                 n_decoder_layers=2
             )
         
@@ -253,51 +405,35 @@ class Trainer:
             if self.config.max_samples:
                 conversations = conversations[:self.config.max_samples]
             train_dataset = ConversationDataset(conversations, self.tokenizer, seq_len)
-        else:
-            texts = load_texts_from_file(self.config.train_data_path)
-            if self.config.max_samples:
-                texts = texts[:self.config.max_samples]
-            train_dataset = TextDataset(texts, self.tokenizer, seq_len)
-        
-        self.train_loader = DataLoader(
-            train_dataset,
-            batch_size=self.config.batch_size,
-            shuffle=True,
-            num_workers=0,
-            pin_memory=True if self.device.type == 'cuda' else False
-        )
-        
-        # Load validation data if available
-        if self.config.val_data_path and os.path.exists(self.config.val_data_path):
-            if self.config.val_data_path.endswith('.jsonl'):
-                val_convs = load_conversations_from_jsonl(self.config.val_data_path)
-                val_dataset = ConversationDataset(val_convs, self.tokenizer, seq_len)
-            else:
-                val_texts = load_texts_from_file(self.config.val_data_path)
-                val_dataset = TextDataset(val_texts, self.tokenizer, seq_len)
-            
-            self.val_loader = DataLoader(
-                val_dataset,
-                batch_size=self.config.batch_size,
-                shuffle=False,
-                num_workers=0
+            self.train_loader = DataLoader(
+                train_dataset, 
+                batch_size=self.config.batch_size, 
+                shuffle=True, 
+                num_workers=0,
+                collate_fn=collate_fn
             )
         else:
-            # Auto-split if no validation file provided
-            val_size = int(len(train_dataset) * 0.1)  # 10% split
-            train_size = len(train_dataset) - val_size
-            
-            # Use fixed generator for reproducibility
-            generator = torch.Generator().manual_seed(42)
+            # Auto-split logic
+            full_dataset = ConversationDataset(conversations, self.tokenizer, seq_len)
+            train_size = int(0.9 * len(full_dataset))
+            val_size = len(full_dataset) - train_size
             train_dataset, val_dataset = torch.utils.data.random_split(
-                train_dataset, [train_size, val_size], generator=generator
+                full_dataset, [train_size, val_size], generator=torch.Generator().manual_seed(42)
             )
             
+            self.train_loader = DataLoader(
+                train_dataset,
+                batch_size=self.config.batch_size,
+                shuffle=True,
+                num_workers=0,
+                collate_fn=collate_fn
+            )
             self.val_loader = DataLoader(
                 val_dataset,
                 batch_size=self.config.batch_size,
                 shuffle=False,
-                num_workers=0
+                num_workers=0,
+                collate_fn=collate_fn
             )
             print(f"Auto-split data: {train_size} train, {val_size} val")
         
@@ -314,13 +450,32 @@ class Trainer:
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1}")
         
         for batch in pbar:
-            batch = batch.to(self.device)
+            # Handle new dict batch
+            if isinstance(batch, dict):
+                input_ids = batch['input_ids'].to(self.device)
+                target_intent = batch['intent'].to(self.device)
+                split_idx = batch['split_idx'].to(self.device)
+                target_answerable = batch['answerable'].to(self.device)
+                # Keep as raw token index for masked loss computation
+            else:
+                input_ids = batch.to(self.device)
+                target_intent = None
+                split_idx = None
+                target_answerable = None
             
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
             
-            with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda')):
-                result = self.model(batch, target_ids=batch)
+            # Use BF16 if available, else FP16
+            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+            with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda'), dtype=dtype):
+                result = self.model(
+                    input_ids, 
+                    target_ids=input_ids,
+                    target_intent=target_intent,
+                    target_answerable=target_answerable,
+                    split_indices=split_idx
+                )
                 loss = result['loss']
             
             # Backward pass
@@ -344,6 +499,12 @@ class Trainer:
             desc = f"Loss: {loss.item():.4f}"
             if 'stop_loss' in result:
                 desc += f" (tok: {result['token_loss']:.3f}, stop: {result['stop_loss']:.3f})"
+            if 'intent_loss' in result:
+                desc += f" (int: {result['intent_loss']:.3f})"
+            if 'answerable_loss' in result:
+                desc += f" (ans: {result['answerable_loss']:.3f})"
+            if 'contrastive_loss' in result:
+                desc += f" (con: {result['contrastive_loss']:.3f})"
             pbar.set_postfix_str(desc)
         
         avg_loss = total_loss / n_batches
@@ -361,8 +522,26 @@ class Trainer:
         n_batches = 0
         
         for batch in self.val_loader:
-            batch = batch.to(self.device)
-            result = self.model(batch, target_ids=batch)
+            if isinstance(batch, dict):
+                input_ids = batch['input_ids'].to(self.device)
+                target_intent = batch['intent'].to(self.device)
+                split_idx = batch['split_idx'].to(self.device)
+                target_answerable = batch['answerable'].to(self.device)
+                # Keep as raw token index for masked loss computation
+            else:
+                input_ids = batch.to(self.device)
+                target_intent = None
+                split_idx = None
+                target_answerable = None
+                
+            with torch.no_grad():
+                result = self.model(
+                    input_ids, 
+                    target_ids=input_ids, 
+                    target_intent=target_intent,
+                    target_answerable=target_answerable,
+                    split_indices=split_idx
+                )
             total_loss += result['loss'].item()
             n_batches += 1
         
