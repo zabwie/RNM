@@ -132,4 +132,4 @@ This is closer to how humans structure responses: think first, then speak.
 
 ## License
 
-Do whatever you want with it. If it works, tell me. If it doesn't, also tell me.
+Do whatever you want with it. If it works, tell me. If it doesn't, also tell me. Just don't around claiming it was your idea. Using/modifying this code for your own projects is allowed, but please credit me as the original author.
