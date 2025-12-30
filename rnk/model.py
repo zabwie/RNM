@@ -22,11 +22,11 @@ class RNKConfig:
     
     def __init__(
         self,
-        vocab_size: int = 2048,
+        vocab_size: int = 256,  # Raw byte vocabulary (no tokenization)
         d_model: int = 256,
         d_hidden: int = 512,
         chunk_size: int = 32,
-        max_len: int = 512,
+        max_len: int = 1024,  # Longer for character-level sequences
         # SSM
         n_fast_layers: int = 3,  # Increased for better state tracking
         n_memory_slots: int = 16,  # Doubled capacity

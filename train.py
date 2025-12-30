@@ -162,7 +162,7 @@ def collate_fn(batch):
 
 from rnk import RNK
 from rnk.model import RNKConfig
-from rnk.tokenizer import RNKTokenizer
+from rnk.byte_encoder import ByteEncoder  # Raw byte encoding (no tokenization)
 
 
 @dataclass
@@ -185,10 +185,10 @@ class TrainConfig:
     grad_clip: float = 1.0
     warmup_steps: int = 100
     
-    # Sequence length - FIXED for tensor core efficiency
+    # Sequence length - Longer for raw byte input (no tokenization)
     use_curriculum: bool = False  # Disabled for static shapes
-    initial_seq_len: int = 256    # Multiple of 32
-    max_seq_len: int = 256        # Fixed = fast kernels
+    initial_seq_len: int = 1024   # Longer for raw byte sequences
+    max_seq_len: int = 1024       # Raw bytes need more length
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -207,16 +207,16 @@ class TextDataset(Dataset):
     def __init__(
         self,
         texts: List[str],
-        tokenizer: RNKTokenizer,
-        max_len: int = 256
+        encoder: ByteEncoder,  # Raw byte encoder (no tokenization)
+        max_len: int = 1024
     ):
-        self.tokenizer = tokenizer
+        self.encoder = encoder
         self.max_len = max_len
         
-        # Tokenize all texts
+        # Encode all texts to raw bytes
         self.samples = []
         for text in texts:
-            ids = tokenizer.encode(text, max_length=max_len, padding=True)
+            ids = encoder.encode(text, max_length=max_len, padding=True)
             if len(ids) >= 16:  # Skip very short samples
                 self.samples.append(ids)
     
@@ -233,10 +233,10 @@ class ConversationDataset(Dataset):
     def __init__(
         self,
         conversations: List[Tuple[str, str]],
-        tokenizer: RNKTokenizer,
-        max_len: int = 256
+        encoder: ByteEncoder,  # Raw byte encoder (no tokenization)
+        max_len: int = 1024
     ):
-        self.tokenizer = tokenizer
+        self.encoder = encoder
         self.max_len = max_len
         
         self.encodings = []
@@ -269,7 +269,7 @@ class ConversationDataset(Dataset):
                 answerable = classify_answerability(inp, out)
                 
                 # Track prompt end (Prediction Point)
-                prompt_enc = tokenizer.encode(prompt_text, padding=False)
+                prompt_enc = self.encoder.encode(prompt_text, padding=False)
                 
                 # Boundary Padding: Pad prompt to chunk boundary (32)
                 chunk_size = 32 # Default RNK chunk size
@@ -280,14 +280,14 @@ class ConversationDataset(Dataset):
                 split_idx = len(prompt_enc)
                 
                 # Encode response and combine
-                response_enc = tokenizer.encode(f" {out}", padding=False)
+                response_enc = self.encoder.encode(f" {out}", padding=False)
                 ids = prompt_enc + response_enc
             else:
                 full_text = str(item)
                 intent = INTENT_MAP['fact']
                 answerable = 1.0  # Default answerable
                 split_idx = 0
-                ids = tokenizer.encode(full_text, max_length=self.max_len, padding=False)
+                ids = self.encoder.encode(full_text, max_length=self.max_len, padding=False)
             # Wait, `collate_fn` handles padding now.
             # But line 108 had `padding=True`.
             # If we switch to dynamic padding, we save memory.
@@ -491,36 +491,14 @@ class Trainer:
         
         print("Memory cleanup complete.")
     
-    def _init_tokenizer(self) -> RNKTokenizer:
-        """Initialize or load tokenizer."""
-        # 8k vocab for better BPE subword merges (especially math/punctuation)
-        tokenizer = RNKTokenizer(vocab_size=8192)
+    def _init_tokenizer(self) -> ByteEncoder:
+        """Initialize byte encoder (no tokenization, raw UTF-8 bytes).
         
-        if os.path.exists(self.config.tokenizer_path):
-            print(f"Loading tokenizer from {self.config.tokenizer_path}")
-            tokenizer.load(self.config.tokenizer_path)
-        else:
-            print("Training new BPE tokenizer...")
-            
-            # Get all texts from training data
-            if self.config.train_data_path.endswith('.jsonl'):
-                conversations = load_conversations_from_jsonl(self.config.train_data_path)
-                texts = [f"{inp} {out}" for inp, out in conversations]
-            else:
-                texts = load_texts_from_file(self.config.train_data_path)
-            
-            # Limit samples for tokenizer training too
-            if self.config.max_samples:
-                texts = texts[:self.config.max_samples]
-            
-            print(f"Training tokenizer on {len(texts)} texts...")
-            tokenizer.train(texts, min_frequency=2)
-            
-            os.makedirs(os.path.dirname(self.config.tokenizer_path) or '.', exist_ok=True)
-            tokenizer.save(self.config.tokenizer_path)
-            print(f"Saved tokenizer to {self.config.tokenizer_path} (vocab size: {len(tokenizer)})")
-        
-        return tokenizer
+        ByteEncoder requires no training or saved state.
+        Vocab size is always 256 (all possible byte values).
+        """
+        print("Using raw byte encoding (no tokenization, vocab=256)")
+        return ByteEncoder(max_len=self.config.max_seq_len)
     
     def _create_model(self) -> RNK:
         """Create model based on size config."""

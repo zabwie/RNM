@@ -1,27 +1,28 @@
 # RNK - Recursive Neuro-Knowledge Model
 
-An **11.5M parameter** language model that achieves coherent conversation through **latent planning** and **Mamba state-space modeling**. No self-attention, O(n) complexity.
+A **5.4M parameter** language model that achieves coherent conversation through **latent planning**, **Mamba state-space modeling**, and **raw byte input** (no tokenization). O(n) complexity.
 
 ## Core Idea
 
 Most language models predict the next token directly. RNK takes a different approach:
 
-1. **Chunk** the input into 32-token blocks
-2. **Process** through Mamba SSM (selective state evolution)
-3. **Plan** each chunk in a compressed latent space (HRM)
-4. **Refine** the plan through symbolic constraints (NS Refiner)
-5. **Decode** the refined intent back to tokens
+1. **Raw bytes** - No tokenization, direct UTF-8 byte input (vocab=256)
+2. **Chunk** the input into 32-byte blocks
+3. **Process** through Mamba SSM (selective state evolution)
+4. **Plan** each chunk in a compressed latent space (HRM)
+5. **Refine** the plan through symbolic constraints (NS Refiner)
+6. **Decode** the refined intent back to bytes
 
-This means the model "thinks before it speaks" - each response is shaped by high-level intent, not just token-by-token prediction.
+This means the model "thinks before it speaks" and **learns character→word→sentence patterns naturally**.
 
 ## Architecture
 
 ```
-Input Tokens
+Raw Bytes (UTF-8)
      │
      ▼
 ┌─────────────┐
-│   Encoder   │  Chunks tokens → latent vectors (32 tok/chunk)
+│   Encoder   │  65K params (256-dim byte embeddings)
 └──────┬──────┘
        │
        ▼
@@ -50,29 +51,34 @@ Input Tokens
 └──────────┘  └──────┘  └────┬────┘
                              │
                              ▼
-                       Output Tokens
+                        Output Bytes
 ```
 
 ### Components
 
 | Module | Size | Purpose |
 |--------|------|---------|
-| Encoder | 2.1M | 32-token chunks → 256-dim latent |
-| **Mamba SSM** | 1.3M | Selective state space (replaces old FastState+SlowMemory) |
+| Encoder | 65K | Raw byte embeddings (256 vocab × 256 dim) |
+| **Mamba SSM** | 1.3M | Selective state space |
 | HRM | 857K | Multi-step planning in latent space |
 | NS Refiner | 659K | Symbolic constraint layer |
-| Decoder | 6.0M | Cross-attention GRU with intent conditioning |
+| Decoder | 2.0M | GRU with intent conditioning |
+
+### Why No Tokenization?
+
+Mamba's O(n) scaling enables **raw byte input**:
+- **No tokenization bias** - Numbers aren't weirdly split
+- **Character-level learning** - Model discovers words/sentences naturally
+- **Better arithmetic** - Digits processed individually
+- **Longer sequences OK** - Mamba handles 1024+ bytes efficiently
 
 ### Mamba SSM Details
 
-The Mamba SSM is a **pure PyTorch** implementation of selective state spaces:
-
-- **4 layers** of MambaBlocks with RMSNorm and residual connections
-- **Selective gating**: Input-dependent A, B, C matrices (not static like S4)
-- **Parallel scan**: O(n) complexity for efficient long sequences
-- **No attention**: Linear scaling, constant memory per token
-
-This replaces the old FastState (GRU) + SlowMemory (slot attention) which had coordination failures.
+Pure PyTorch implementation of selective state spaces:
+- **4 layers** of MambaBlocks with RMSNorm
+- **Selective gating**: Input-dependent A, B, C matrices
+- **Parallel scan**: O(n) complexity
+- **No attention**: Linear scaling
 
 ### Auxiliary Heads
 
