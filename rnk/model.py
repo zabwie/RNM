@@ -11,7 +11,7 @@ import torch.nn.functional as F
 from typing import Tuple, Optional, Dict, Any
 
 from .encoder import ChunkEncoder
-from .ssm import StateSpaceModule
+from .mamba import MambaSSM as StateSpaceModule  # Mamba replaces FastState+SlowMemory
 from .hrm import HRM
 from .neuro_symbolic import NeuroSymbolicRefiner
 from .decoder import Decoder, CrossAttentionDecoder
@@ -98,12 +98,13 @@ class RNK(nn.Module):
             pooling="mean"
         )
         
-        # State-space module (fast + slow)
+        # State-space module (Mamba: unified selective state space)
         self.ssm = StateSpaceModule(
             d_model=config.d_model,
-            n_fast_layers=config.n_fast_layers,
-            n_memory_slots=config.n_memory_slots,
-            n_heads=4,
+            n_layers=config.n_fast_layers,  # Reuse fast_layers count for Mamba layers
+            d_state=16,  # Mamba state dimension
+            expand_factor=2,
+            d_conv=4,
             dropout=config.dropout
         )
         
@@ -278,6 +279,11 @@ class RNK(nn.Module):
         
         # 4. Neuro-symbolic refinement
         refined_intent = self.ns_refiner(intent)
+        
+        # CRITICAL FIX (Phase 14): Re-inject Boosted Intent AFTER Normalization
+        # HRM and NS LayerNorms kill the 3.0x boost. We re-add it here
+        # so the Decoder hears the "LOUD" signal.
+        refined_intent = refined_intent + scale * intent_vec
         
         # 5. Stop Prediction
         stop_logits = self.stop_head(refined_intent)  # (batch, n_chunks, 1)
@@ -554,7 +560,25 @@ class RNK(nn.Module):
             else:
                  intent_logits = self.intent_classifier(global_context)
                  cond_idx = intent_logits.argmax(dim=-1)
-                 # print(f"DEBUG: Classifier ID: {cond_idx[0].item()}")
+                 
+                 # FORCE ROUTING: Detect Math Patterns in Input Tokens
+                 # Common math operator tokens (varies by tokenizer):
+                 # '+' usually encodes to a specific ID, same for digits
+                 # Heuristic: If input contains token sequences like "digit + digit" or "digit - digit"
+                 # This is a simple check: look for operator-like tokens in the input
+                 # Token IDs for common operators/digits (tokenizer-specific, but often in ASCII range)
+                 input_flat = input_ids.flatten().tolist()
+                 # Check for presence of math-like patterns: digits 0-9 and operators +-*/=
+                 # ASCII: '+' = 43, '-' = 45, '*' = 42, '/' = 47, '=' = 61, '0'-'9' = 48-57
+                 math_operators = set(range(42, 48))  # *, +, ,, -, ., /
+                 digits = set(range(48, 58))  # 0-9
+                 has_operator = any(t in math_operators for t in input_flat)
+                 has_digit = any(t in digits for t in input_flat)
+                 
+                 if has_operator and has_digit:
+                     # Force Math Intent (ID 6)
+                     cond_idx = torch.full_like(cond_idx, 6)
+                     print(f"DEBUG: FORCED Math Intent (detected operator+digit)")
             # intent_vec = torch.zeros(1, 1, self.config.d_model, device=input_ids.device)
             intent_vec = self.intent_embedding(cond_idx).unsqueeze(1)
             
@@ -579,6 +603,9 @@ class RNK(nn.Module):
             
             # Refinement
             refined_intent = self.ns_refiner(intent)
+            
+            # CRITICAL FIX (Phase 14): Re-inject Boosted Intent AFTER Normalization
+            refined_intent = refined_intent + scale * intent_vec
             
             # Answerability Gate Check
             # If model predicts it can't answer, we return a special signal

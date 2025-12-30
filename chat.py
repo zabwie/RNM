@@ -45,8 +45,8 @@ while True:
             output_ids, _, _ = model.generate(
                 input_ids, 
                 max_new_tokens=30,
-                temperature=0.5,
-                top_k=30,
+                temperature=0.3,  # Lower for deterministic testing
+                top_k=10,  # More constrained
                 repetition_penalty=1.2
                 # NO target_intent = natural prediction
             )

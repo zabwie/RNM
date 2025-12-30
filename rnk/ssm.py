@@ -1,9 +1,16 @@
 """
-State Space Module: Fast State + Slow Memory
+⚠️ DEPRECATED - DO NOT USE ⚠️
 
-Handles sequential dependencies and coherence:
-- FastState: 1-2 GRU layers, high-frequency updates, local coherence
-- SlowMemory: Slot-based attention, long-term context
+This module contains the OLD State Space implementation (FastState + SlowMemory).
+It has been REPLACED by Mamba (see mamba.py).
+
+This file is kept for historical reference only.
+For active development, use: from .mamba import MambaSSM
+
+Why deprecated:
+- FastState + SlowMemory had coordination failures
+- Mamba provides unified selective state space with better grokking
+- Mamba is more efficient, easier to use, less complicated and less vulnerable to coordination failures or repeated patterns
 """
 
 import torch
