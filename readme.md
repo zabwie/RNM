@@ -1,15 +1,16 @@
 # RNK - Recursive Neuro-Knowledge Model
 
-A **6M parameter** language model that achieves coherent conversation through **latent planning** rather than pure autoregression. No self-attention, O(n) complexity.
+An **11.5M parameter** language model that achieves coherent conversation through **latent planning** and **Mamba state-space modeling**. No self-attention, O(n) complexity.
 
 ## Core Idea
 
 Most language models predict the next token directly. RNK takes a different approach:
 
 1. **Chunk** the input into 32-token blocks
-2. **Plan** each chunk in a compressed latent space (HRM)
-3. **Refine** the plan through symbolic constraints (NS Refiner)
-4. **Decode** the refined intent back to tokens
+2. **Process** through Mamba SSM (selective state evolution)
+3. **Plan** each chunk in a compressed latent space (HRM)
+4. **Refine** the plan through symbolic constraints (NS Refiner)
+5. **Decode** the refined intent back to tokens
 
 This means the model "thinks before it speaks" - each response is shaped by high-level intent, not just token-by-token prediction.
 
@@ -25,7 +26,8 @@ Input Tokens
        │
        ▼
 ┌─────────────┐
-│     SSM     │  State Space Model (fast + slow memory)
+│  Mamba SSM  │  Selective State Space (unified fast+slow dynamics)
+│  (4 layers) │  Input-dependent gating, O(n) complexity
 └──────┬──────┘
        │
   ┌────┴────┐
@@ -55,17 +57,28 @@ Input Tokens
 
 | Module | Size | Purpose |
 |--------|------|---------|
-| Encoder | 524K | 32-token chunks → 256-dim latent |
-| SSM | 1.98M | Dual memory (fast GRU + slow accumulator) |
+| Encoder | 2.1M | 32-token chunks → 256-dim latent |
+| **Mamba SSM** | 1.3M | Selective state space (replaces old FastState+SlowMemory) |
 | HRM | 857K | Multi-step planning in latent space |
 | NS Refiner | 659K | Symbolic constraint layer |
-| Decoder | 2.17M | GRU with intent conditioning |
+| Decoder | 6.0M | Cross-attention GRU with intent conditioning |
+
+### Mamba SSM Details
+
+The Mamba SSM is a **pure PyTorch** implementation of selective state spaces:
+
+- **4 layers** of MambaBlocks with RMSNorm and residual connections
+- **Selective gating**: Input-dependent A, B, C matrices (not static like S4)
+- **Parallel scan**: O(n) complexity for efficient long sequences
+- **No attention**: Linear scaling, constant memory per token
+
+This replaces the old FastState (GRU) + SlowMemory (slot attention) which had coordination failures.
 
 ### Auxiliary Heads
 
 | Head | Type | Purpose |
 |------|------|---------|
-| **Intent** | 5-class | greeting / question / fact / refusal / opinion |
+| **Intent** | 7-class | greeting / question / fact / refusal / opinion / identity / math |
 | **Answerable** | Binary | "Can I answer this?" gate (prevents hallucination) |
 | **Stop** | Binary | Per-chunk termination signal |
 
@@ -95,27 +108,28 @@ python generate.py --prompt "What is the capital of France?"
 
 ## Current Status
 
-- **Parameters**: 6.19M
-- **Architecture**: Stable ✓
-- **Training**: Working ✓
-- **Q→A Binding**: In progress (training on Alpaca dataset)
+- **Parameters**: 11.5M
+- **Architecture**: Mamba SSM ✓ (replaced FastState+SlowMemory)
+- **Training**: 500-epoch grokking run in progress
+- **Goal**: Coherent conversation through extended training
 
-### Sample Output (pre-Alpaca)
+### Sample Output (target)
 ```
 Prompt: Hello, how are you?
-Response: I am glad to hear that, sharing helps with yourself and understanding...
+Response: Hi! I'm doing well, thanks for asking. How can I help you today?
 ```
-*Generic but grammatical - needs Q→A data to learn instruction-following.*
+*Training with grokking strategy to achieve this.*
 
 ## Roadmap
 
-- [x] Intent Head (5-class classification)
+- [x] Intent Head (7-class classification)
 - [x] Answerability Gate (hallucination prevention)
 - [x] Stop Head (knows when to finish)
 - [x] Contrastive Loss (prompt-response binding)
 - [x] Role Separation (User/Model format)
-- [ ] Train on instruction-following data (Alpaca)
-- [ ] Evaluate Q→A accuracy
+- [x] **Mamba SSM** (replaced old FastState+SlowMemory)
+- [/] Grokking training (500 epochs on clean data)
+- [ ] Coherent conversation verification
 - [ ] Scale to 20-30M params (if architecture proves out)
 
 ## Design Philosophy
