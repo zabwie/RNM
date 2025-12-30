@@ -33,7 +33,8 @@ INTENT_MAP = {
     'fact': 2,  # Default
     'refusal': 3,
     'opinion': 4,
-    'joke': 5
+    'joke': 5,
+    'math': 6
 }
 
 def classify_intent(text: str, prompt: str = "") -> int:
@@ -41,28 +42,34 @@ def classify_intent(text: str, prompt: str = "") -> int:
     text = text.lower().strip()
     prompt = prompt.lower().strip()
     
-    # 1. Joke (Highest Priority Override via Prompt)
+    # 1. Math (Highest Priority) - Fixes "Fact" overlap
+    # Detects numbers with operators or math keywords
+    if re.search(r'\b(\d+[\s]*[\+\-\*\/][\s]*\d+)\b', text) or \
+       re.search(r'\b(sum|difference|product|divided by|plus|minus|calculate)\b', text):
+        return INTENT_MAP['math']
+
+    # 2. Joke (Highest Priority Override via Prompt)
     if re.search(r'\b(joke|funny|laugh|pun)\b', prompt):
         return INTENT_MAP['joke']
         
-    # 2. Refusal (Negative sentiment)
+    # 3. Refusal (Negative sentiment)
     if re.search(r'\b(no|not|cannot|can\'t|don\'t|stop|sorry|unable)\b', text):
         return INTENT_MAP['refusal']
 
-    # 3. Greeting (Start of sentence/conversation)
+    # 4. Greeting (Start of sentence/conversation)
     # Strict anchor at start ^
     if re.search(r'^(hello|hi|hey|greetings|good morning|good evening)\b', text):
         return INTENT_MAP['greeting']
     
-    # 4. Question (Ends with ? or starts with WH-word)
+    # 5. Question (Ends with ? or starts with WH-word)
     if "?" in text or re.search(r'^(what|why|how|when|where|who)\b', text):
         return INTENT_MAP['question']
         
-    # 5. Opinion (Subjective markers)
+    # 6. Opinion (Subjective markers)
     if re.search(r'\b(i think|i feel|believe|opinion|my view)\b', text):
         return INTENT_MAP['opinion']
         
-    # 6. Fact (Default)
+    # 7. Fact (Default)
     return INTENT_MAP['fact']
 
 def classify_answerability(prompt: str, response: str) -> float:
@@ -113,12 +120,17 @@ def collate_fn(batch):
         split_indices = torch.stack([b['split_idx'] for b in batch])
         answerabilities = torch.stack([b['answerable'] for b in batch])
         
-        # Pad sequences
-        max_len = max(len(ids) for ids in input_ids)
+        # Weights (Optional)
+        weights = None
+        if 'weight' in batch[0] and batch[0]['weight'] is not None:
+            weights = torch.stack([b['weight'] for b in batch])
         
-        # Critical: Pad to chunk_size multiple (32)
-        # The encoder truncates to chunk boundaries. If we don't pad here, 
-        # the response (which starts after a boundary) might be truncated, 
+        # STATIC PADDING: Always pad to fixed length (multiple of 32)
+        # This ensures tensor cores are used efficiently
+        FIXED_SEQ_LEN = 256  # Must be multiple of 32
+        max_len = FIXED_SEQ_LEN
+        
+        # Critical: Fixed length = fast tensor core kernels 
         # leading to 0 loss and no training.
         chunk_size = 32 
         if max_len % chunk_size != 0:
@@ -132,7 +144,8 @@ def collate_fn(batch):
             'input_ids': padded_ids.to(intents.device), 
             'intent': intents,
             'split_idx': split_indices,
-            'answerable': answerabilities
+            'answerable': answerabilities,
+            'weight': weights
         }
     elif isinstance(elem, torch.Tensor):
         # Tensor batch (TextDataset)
@@ -172,10 +185,10 @@ class TrainConfig:
     grad_clip: float = 1.0
     warmup_steps: int = 100
     
-    # Curriculum
-    use_curriculum: bool = True
-    initial_seq_len: int = 128
-    max_seq_len: int = 256
+    # Sequence length - FIXED for tensor core efficiency
+    use_curriculum: bool = False  # Disabled for static shapes
+    initial_seq_len: int = 256    # Multiple of 32
+    max_seq_len: int = 256        # Fixed = fast kernels
     
     # Checkpointing
     checkpoint_dir: str = "checkpoints"
@@ -183,6 +196,9 @@ class TrainConfig:
     
     # Device
     device: str = "auto"  # "auto", "cuda", "cpu"
+    
+    # Resume
+    resume_path: Optional[str] = None
 
 
 class TextDataset(Dataset):
@@ -227,24 +243,35 @@ class ConversationDataset(Dataset):
         self.intents = []
         self.split_indices = []
         self.answerabilities = []  # Answerability Gate labels
+        self.weights = []
         
         for item in conversations:
-            if isinstance(item, (tuple, list)) and len(item) >= 2:
+            weight = 1.0
+            inp, out = None, None
+            weight = 1.0
+            is_pair = False
+            
+            if isinstance(item, dict):
+                inp = item['input']
+                out = item['output']
+                weight = item.get('weight', 1.0)
+                is_pair = True
+            elif isinstance(item, (tuple, list)) and len(item) >= 2:
                 inp, out = item
+                is_pair = True
+            
+            if is_pair:
                 # Format: "User: <inp>\nModel: <out>"
-                # This enforces Q->A structure and role separation
                 prompt_text = f"User: {inp}\nModel:"
                 full_text = f"{prompt_text} {out}"
                 
-                intent = classify_intent(out, prompt=inp)
+                intent = classify_intent(inp, prompt=inp)
                 answerable = classify_answerability(inp, out)
                 
                 # Track prompt end (Prediction Point)
                 prompt_enc = tokenizer.encode(prompt_text, padding=False)
                 
                 # Boundary Padding: Pad prompt to chunk boundary (32)
-                # This ensures the Prompt ends exactly at a chunk limit
-                # So Intent(Prompt Chunk) -> Predicts(Response Chunk)
                 chunk_size = 32 # Default RNK chunk size
                 pad_len = (chunk_size - len(prompt_enc) % chunk_size) % chunk_size
                 if pad_len > 0:
@@ -253,8 +280,6 @@ class ConversationDataset(Dataset):
                 split_idx = len(prompt_enc)
                 
                 # Encode response and combine
-                # Note: We encode separately to preserve boundary, then concat
-                # Space before output is implicit in previous structure but let's be explicit
                 response_enc = tokenizer.encode(f" {out}", padding=False)
                 ids = prompt_enc + response_enc
             else:
@@ -280,6 +305,7 @@ class ConversationDataset(Dataset):
                 self.intents.append(torch.tensor(intent, dtype=torch.long))
                 self.split_indices.append(torch.tensor(split_idx, dtype=torch.long))
                 self.answerabilities.append(torch.tensor(answerable, dtype=torch.float))
+                self.weights.append(torch.tensor(weight, dtype=torch.float))
     
     def __len__(self) -> int:
         return len(self.encodings)
@@ -289,7 +315,8 @@ class ConversationDataset(Dataset):
             'input_ids': self.encodings[idx],
             'intent': self.intents[idx],
             'split_idx': self.split_indices[idx],
-            'answerable': self.answerabilities[idx]
+            'answerable': self.answerabilities[idx],
+            'weight': self.weights[idx]
         }
 
 
@@ -300,12 +327,52 @@ def load_texts_from_file(path: str) -> List[str]:
 
 
 def load_conversations_from_jsonl(path: str) -> List[Tuple[str, str]]:
-    """Load conversations from JSONL ({"input": ..., "output": ...})."""
+    """Load conversations from JSONL - auto-detects format.
+    
+    Supports:
+    - Simple format: {"input": ..., "output": ...}
+    - OASST2 format: {"text": ..., "role": ..., "parent_id": ...}
+    """
     conversations = []
+    messages = []
+    
     with open(path, 'r', encoding='utf-8') as f:
         for line in f:
             data = json.loads(line)
-            conversations.append((data['input'], data['output']))
+            messages.append(data)
+    
+    # Detect format
+    if messages and ('input' in messages[0] or 'instruction' in messages[0]):
+        # Simple format (Dolly/Alpaca style)
+        for data in messages:
+            # Normalize keys
+            if 'instruction' in data and 'input' not in data:
+                # If context exists, append it? Or just use instruction?
+                # Usually instruction + context
+                if data.get('context'):
+                    data['input'] = f"{data['instruction']}\n{data['context']}"
+                else:
+                    data['input'] = data['instruction']
+            
+            if 'response' in data and 'output' not in data:
+                data['output'] = data['response']
+                
+            # Pass full dict to support 'weight'
+            conversations.append(data)
+    elif messages and 'role' in messages[0]:
+        # OASST2 format - build parent-child pairs
+        msg_dict = {m['message_id']: m for m in messages}
+        
+        for msg in messages:
+            # Find assistant replies to user messages
+            if msg['role'] == 'assistant' and msg.get('parent_id'):
+                parent = msg_dict.get(msg['parent_id'])
+                if parent and parent.get('role') == 'prompter':
+                    user_text = parent.get('text', '')
+                    assistant_text = msg.get('text', '')
+                    if user_text and assistant_text:
+                        conversations.append((user_text, assistant_text))
+    
     return conversations
 
 
@@ -329,6 +396,49 @@ class Trainer:
         # Create model
         self.model = self._create_model()
         self.model.to(self.device)
+        
+        # Resume
+        if self.config.resume_path:
+            if os.path.exists(self.config.resume_path):
+                print(f"Resuming training from {self.config.resume_path}...")
+                checkpoint = torch.load(self.config.resume_path, map_location=self.device)
+                state_dict = checkpoint['model_state']
+                
+                # Check for Intent Embedding Mismatch (6 -> 7)
+                if 'intent_embedding.weight' in state_dict:
+                    emb = state_dict['intent_embedding.weight']
+                    if emb.shape[0] == 6 and self.model.config.n_intents == 7:
+                        print("Patching Intent Embedding (6 -> 7) for Math Intent...")
+                        # Create new embedding tensor (7, D)
+                        new_emb = torch.zeros(7, emb.shape[1], device=emb.device)
+                        new_emb[:6] = emb 
+                        new_emb[6] = emb[2].clone() + torch.randn_like(emb[2]) * 0.02
+                        state_dict['intent_embedding.weight'] = new_emb
+                
+                # Check for Intent Classifier Mismatch (6 -> 7)
+                if 'intent_classifier.weight' in state_dict:
+                     cls_w = state_dict['intent_classifier.weight']
+                     if cls_w.shape[0] == 6 and self.model.config.n_intents == 7:
+                         print("Patching Intent Classifier (6 -> 7)...")
+                         # Weight: (Out, In) -> (7, 256)
+                         new_w = torch.zeros(7, cls_w.shape[1], device=cls_w.device)
+                         new_w[:6] = cls_w
+                         # Init Math (6) output weights similar to Fact (2)
+                         # This means it triggers on similar contexts initially
+                         new_w[6] = cls_w[2].clone() + torch.randn_like(cls_w[2]) * 0.02
+                         state_dict['intent_classifier.weight'] = new_w
+                         
+                         if 'intent_classifier.bias' in state_dict:
+                             cls_b = state_dict['intent_classifier.bias']
+                             new_b = torch.zeros(7, device=cls_b.device)
+                             new_b[:6] = cls_b
+                             new_b[6] = cls_b[2].clone()
+                             state_dict['intent_classifier.bias'] = new_b
+
+                self.model.load_state_dict(state_dict, strict=False)
+                print("Model weights loaded.")
+            else:
+                print(f"Warning: Resume path {self.config.resume_path} not found. Starting fresh.")
         
         print(f"Model parameters: {self.model.count_parameters():,}")
         print("Breakdown:", self.model.get_param_breakdown())
@@ -383,7 +493,8 @@ class Trainer:
     
     def _init_tokenizer(self) -> RNKTokenizer:
         """Initialize or load tokenizer."""
-        tokenizer = RNKTokenizer(vocab_size=2048)
+        # 8k vocab for better BPE subword merges (especially math/punctuation)
+        tokenizer = RNKTokenizer(vocab_size=8192)
         
         if os.path.exists(self.config.tokenizer_path):
             print(f"Loading tokenizer from {self.config.tokenizer_path}")
@@ -430,6 +541,18 @@ class Trainer:
                 n_hrm_layers=4,
                 n_fast_layers=2,
                 n_decoder_layers=2
+            )
+        elif self.config.model_size == "xl":
+            # ~50M params: balanced for 80k samples
+            config = RNKConfig(
+                vocab_size=len(self.tokenizer) or 2048,
+                d_model=704,          # Tuned for 50M target
+                d_hidden=1408,        # 2x d_model
+                n_hrm_layers=4,       
+                n_fast_layers=3,      
+                n_memory_slots=16,    
+                n_decoder_layers=3,   
+                chunk_size=32
             )
         else:  # base
             config = RNKConfig(
@@ -506,26 +629,23 @@ class Trainer:
         total_loss = 0
         n_batches = 0
         
-        # Scheduled Sampling: Linear ramp from 0.0 to 0.5 after warmup
-        # Conservative schedule to prevent model from collapsing on own errors
-        k = 0.5  # Max sampling probability
-        warmup = 5 # Epochs of pure teacher forcing
-        if epoch < warmup:
-            sampling_prob = 0.0
-        else:
-            progress = min(1.0, (epoch - warmup) / max(1, self.config.epochs - warmup))
-            sampling_prob = k * progress
+        # Scheduled Sampling DISABLED for XL training
+        # The slow loop path kills tensor core performance
+        # TODO: Re-enable after optimizing decoder loop
+        sampling_prob = 0.0  # Always use fast batch path
             
         pbar = tqdm(self.train_loader, desc=f"Epoch {epoch+1} (p={sampling_prob:.2f})")
         
         for batch in pbar:
             # Handle new dict batch
+            sample_weights = None
             if isinstance(batch, dict):
                 input_ids = batch['input_ids'].to(self.device)
                 target_intent = batch['intent'].to(self.device)
                 split_idx = batch['split_idx'].to(self.device)
                 target_answerable = batch['answerable'].to(self.device)
-                # Keep as raw token index for masked loss computation
+                if 'weight' in batch and batch['weight'] is not None:
+                    sample_weights = batch['weight'].to(self.device)
             else:
                 input_ids = batch.to(self.device)
                 target_intent = None
@@ -535,16 +655,17 @@ class Trainer:
             # Forward pass with mixed precision
             self.optimizer.zero_grad()
             
-            # Use BF16 if available, else FP16
-            dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-            with torch.cuda.amp.autocast(enabled=(self.device.type == 'cuda'), dtype=dtype):
+            # FP16 ONLY - tensor cores require fp16 on consumer GPUs
+            dtype = torch.float16
+            with torch.amp.autocast('cuda', enabled=(self.device.type == 'cuda'), dtype=dtype):
                 result = self.model(
                     input_ids, 
                     target_ids=input_ids,
                     target_intent=target_intent,
                     target_answerable=target_answerable,
                     split_indices=split_idx,
-                    sampling_prob=sampling_prob
+                    sampling_prob=sampling_prob,
+                    sample_weights=sample_weights
                 )
                 loss = result['loss']
             
@@ -614,7 +735,8 @@ class Trainer:
                     target_ids=input_ids, 
                     target_intent=target_intent,
                     target_answerable=target_answerable,
-                    split_indices=split_idx
+                    split_indices=split_idx,
+                    sample_weights=None # Validation - no weighting? Or use weighting? Usually no weighting for metric.
                 )
             total_loss += result['loss'].item()
             n_batches += 1
@@ -724,12 +846,13 @@ def main():
     parser = argparse.ArgumentParser(description="Train RNK model")
     parser.add_argument("--train", type=str, default="data/train.txt", help="Training data path")
     parser.add_argument("--val", type=str, default=None, help="Validation data path")
-    parser.add_argument("--size", type=str, default="base", choices=["small", "base", "large"])
+    parser.add_argument("--size", type=str, default="base", choices=["small", "base", "large", "xl"])
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)
     parser.add_argument("--device", type=str, default="auto")
     parser.add_argument("--max-samples", type=int, default=100000, help="Limit training samples")
+    parser.add_argument("--resume", type=str, default=None, help="Resume checkpoint")
     args = parser.parse_args()
     
     config = TrainConfig(
@@ -740,7 +863,8 @@ def main():
         batch_size=args.batch,
         learning_rate=args.lr,
         device=args.device,
-        max_samples=args.max_samples
+        max_samples=args.max_samples,
+        resume_path=args.resume
     )
     
     trainer = Trainer(config)

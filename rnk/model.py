@@ -14,7 +14,7 @@ from .encoder import ChunkEncoder
 from .ssm import StateSpaceModule
 from .hrm import HRM
 from .neuro_symbolic import NeuroSymbolicRefiner
-from .decoder import Decoder
+from .decoder import Decoder, CrossAttentionDecoder
 
 
 class RNKConfig:
@@ -38,7 +38,7 @@ class RNKConfig:
         # Decoder
         n_decoder_layers: int = 2,
         # Intent Head
-        n_intents: int = 6,  # Fact, Greeting, Refusal, Question, Opinion, Joke
+        n_intents: int = 7,  # Fact, Greeting, Refusal, Question, Opinion, Joke, Math
         # Training
         dropout: float = 0.1,
         n_planning_steps: int = 5,  # Increased to 5 for deep latent sketching
@@ -156,12 +156,13 @@ class RNK(nn.Module):
             nn.Linear(config.d_hidden, 1)
         )
         
-        # Decoder
-        self.decoder = Decoder(
+        # Decoder with cross-attention to encoder outputs
+        self.decoder = CrossAttentionDecoder(
             vocab_size=config.vocab_size,
             d_model=config.d_model,
             d_hidden=config.d_model,
             n_layers=config.n_decoder_layers,
+            n_heads=4,  # Cross-attention heads
             chunk_size=config.chunk_size,
             dropout=config.dropout
         )
@@ -177,14 +178,18 @@ class RNK(nn.Module):
         slow_memory: Optional[torch.Tensor] = None,
         prev_intent: Optional[torch.Tensor] = None,
         return_states: bool = False,
-        sampling_prob: float = 0.0
+        sampling_prob: float = 0.0,
+        sample_weights: Optional[torch.Tensor] = None
     ) -> Dict[str, torch.Tensor]:
         """
-        Full RNK forward pass.
+        Forward pass with optional planning and weighted loss.
         
         Args:
             input_ids: (batch, seq_len) input token IDs
             target_ids: (batch, seq_len) target tokens for teacher forcing
+            target_intent: (batch,) target intent for classification
+            target_answerable: (batch,) target for answerability head
+            split_indices: (batch,) indices indicating where prompt ends and response begins
             fast_hidden: previous fast state (for streaming)
             slow_memory: previous slow memory (for streaming)
             prev_intent: previous intent vector (for smoothing)
@@ -199,8 +204,10 @@ class RNK(nn.Module):
         """
         batch_size = input_ids.size(0)
         
-        # 1. Encode chunks
-        chunk_latents = self.encoder(input_ids)  # (batch, n_chunks, d_model)
+        # 1. Encode chunks (also get token embeddings for cross-attention)
+        chunk_latents, token_embeddings = self.encoder(input_ids, return_token_embeddings=True)
+        # chunk_latents: (batch, n_chunks, d_model)
+        # token_embeddings: (batch, seq_len, d_model)
         
         # 2. State-space processing
         ssm_out, fast_hidden, slow_memory = self.ssm(
@@ -229,7 +236,15 @@ class RNK(nn.Module):
              cond_idx = intent_logits.argmax(dim=-1)
              
         intent_vec = self.intent_embedding(cond_idx).unsqueeze(1)
-        ssm_out = ssm_out + 0.5 * intent_vec # Safe Injection (prevent training instability)
+        
+        # Selective Boost: Identify Math Intent (ID 6)
+        # Create scale factor: 3.0 for Math, 1.0 for others
+        # cond_idx shape: (B,)
+        scale = torch.ones_like(cond_idx, dtype=torch.float32, device=input_ids.device)
+        scale[cond_idx == 6] = 3.0
+        scale = scale.view(-1, 1, 1) # (B, 1, 1) to broadcast over d_model and chunk dimensions
+        
+        ssm_out = ssm_out + scale * intent_vec # Force Injection (Precision Boost)
         
         # 4. Hierarchical reasoning
         if self.config.n_planning_steps > 1:
@@ -278,11 +293,27 @@ class RNK(nn.Module):
         # This teaches GRU to properly continue from prompt while keeping Intent guidance
         
         if target_ids is not None:
-            # Decoder sees full sequence for teacher forcing (or scheduled sampling)
+            # CRITICAL FIX: Decoder cross-attention should ONLY see prompt tokens
+            # During training, we have full sequence, but we must mask response tokens
+            # Otherwise decoder "cheats" by attending to the answer during training
+            # but during inference those tokens aren't available
+            
+            if split_indices is not None:
+                # Create mask for prompt-only tokens
+                # token_embeddings shape: (B, seq_len, d_model)
+                max_split = split_indices.max().item()
+                # Only give decoder the first max_split tokens (prompt)
+                prompt_embeddings = token_embeddings[:, :max_split, :]
+            else:
+                # No split info - use all embeddings
+                prompt_embeddings = token_embeddings
+            
+            # Decoder sees full sequence for teacher forcing
+            # But cross-attention only sees PROMPT embeddings
             logits, dec_hidden = self.decoder(
-                refined_intent, 
-                target_ids, 
-                sampling_prob=sampling_prob
+                refined_intent,
+                encoder_output=prompt_embeddings,  # Only prompt! Not response!
+                target_tokens=target_ids
             )
             
             # Compute loss only on RESPONSE tokens (after split_idx)
@@ -317,11 +348,16 @@ class RNK(nn.Module):
             loss_fct = nn.CrossEntropyLoss(ignore_index=0, reduction='none')
             per_token_loss = loss_fct(flat_logits, flat_targets)
             
-            # Apply mask and compute mean over response tokens only
+            # Reshape to (B, Seq-1) to compute per-sample mean
             masked_loss = per_token_loss * flat_mask
-            token_loss = masked_loss.sum() / (flat_mask.sum() + 1e-8)
+            masked_loss = masked_loss.view(batch_size_loss, -1)
+            mask_reshaped = flat_mask.view(batch_size_loss, -1)
+            
+            # Per-sample token loss
+            token_loss_per_sample = masked_loss.sum(dim=1) / (mask_reshaped.sum(dim=1) + 1e-8)
         else:
-            token_loss = torch.tensor(0.0, device=input_ids.device)
+            token_loss_per_sample = torch.zeros(batch_size, device=input_ids.device)
+            # Dummy for graph?
             logits = torch.zeros(
                 batch_size, 1, self.config.vocab_size, 
                 device=input_ids.device, requires_grad=True
@@ -349,28 +385,28 @@ class RNK(nn.Module):
             stop_targets = torch.zeros(batch_size, intent.size(1), device=logits.device)
             stop_targets.scatter_(1, last_chunk_indices.unsqueeze(1), 1.0)
             
-            stop_loss_fct = nn.BCEWithLogitsLoss()
-            stop_loss = stop_loss_fct(stop_logits.squeeze(2), stop_targets)
+            stop_loss_fct = nn.BCEWithLogitsLoss(reduction='none')
+            stop_loss = stop_loss_fct(stop_logits.squeeze(2), stop_targets).mean(dim=1) # (B,)
             
-            # Total Loss
+            # Total Loss Per Sample
             # Weighted sum: Token + Stop + Intent
-            loss = token_loss + 0.5 * stop_loss
+            total_loss_per_sample = token_loss_per_sample + 0.5 * stop_loss
             
             if target_intent is not None:
-                intent_loss_fct = nn.CrossEntropyLoss()
+                intent_loss_fct = nn.CrossEntropyLoss(reduction='none')
                 intent_loss = intent_loss_fct(intent_logits, target_intent)
-                loss += 0.5 * intent_loss  # Upweighted to fix mode collapse
-                result['intent_loss'] = intent_loss
+                total_loss_per_sample += 0.5 * intent_loss  # Upweighted to fix mode collapse
+                result['intent_loss'] = intent_loss.mean()
             
             # Answerability Loss
             if target_answerable is not None:
-                answerable_loss_fct = nn.BCEWithLogitsLoss()
+                answerable_loss_fct = nn.BCEWithLogitsLoss(reduction='none')
                 answerable_loss = answerable_loss_fct(
                     answerable_logits.squeeze(-1), 
                     target_answerable
-                )
-                loss += 0.3 * answerable_loss
-                result['answerable_loss'] = answerable_loss
+                ) # (B,)
+                total_loss_per_sample += 0.3 * answerable_loss
+                result['answerable_loss'] = answerable_loss.mean()
             
             # Latent Prediction Loss (Transition Model)
             # Predict Intent[t+1] from Intent[t]
@@ -384,18 +420,24 @@ class RNK(nn.Module):
             # Actually, predictability is good universally.
             # But let's verify dimensions match
             if pred_shift.shape[1] > 0:
-                 latent_loss_fct = nn.MSELoss()
-                 latent_loss = latent_loss_fct(pred_shift, target_shift.detach()) # Detach target to stop auto-encoder collapse?
-                 # If we don't detach, HRM tries to make intent predictable. If we detach, Predictor tries to match.
-                 # Both are valid. Let's not detach to enforce semantic smoothness.
+                 latent_loss_fct = nn.MSELoss(reduction='none')
+                 latent_loss_raw = latent_loss_fct(pred_shift, target_shift.detach()) 
+                 # (B, T, D) -> Mean over T, D -> (B,)
+                 latent_loss = latent_loss_raw.mean(dim=(1,2))
                  
-                 loss += 1.0 * latent_loss # Strong supervision for planning
-                 result['latent_loss'] = latent_loss
+                 total_loss_per_sample += 1.0 * latent_loss 
+                 result['latent_loss'] = latent_loss.mean()
+            
+            # Finalize Main Loss (Weighted Mean)
+            if sample_weights is not None:
+                loss = (total_loss_per_sample * sample_weights).mean()
+            else:
+                loss = total_loss_per_sample.mean()
             
             if split_indices is not None and split_indices.size(0) > 1:
                 # Contrastive Loss (InfoNCE)
                 # Maximize similarity between Prompt State and Response State for same sample
-                batch_idx = torch.arange(batch_size, device=loss.device)
+                batch_idx = torch.arange(batch_size, device=input_ids.device)
                 
                 # Clamp indices to valid range
                 split_indices = split_indices.clamp(0, ssm_out.size(1) - 1)
@@ -413,7 +455,7 @@ class RNK(nn.Module):
                 con_loss_fct = nn.CrossEntropyLoss()
                 contrastive_loss = con_loss_fct(logits_con, batch_idx)
                 
-                loss += 0.1 * contrastive_loss
+                loss += 1.0 * contrastive_loss
                 result['contrastive_loss'] = contrastive_loss
                 
                 # Relevance Head Loss (Binary Classification)
@@ -429,19 +471,32 @@ class RNK(nn.Module):
                 neg_input = torch.cat([z_prompt, neg_response], dim=1)
                 neg_logits = self.relevance_head(neg_input) # (batch, 1)
                 
+                # HARD NEGATIVE (Self-Correction)
+                # Teach filter to reject model's own current bad predictions
+                # Use the predicted intent from Latent Predictor
+                # We use the LAST predicted intent which corresponds to the Response state
+                pred_response = pred_intents[:, -1, :] 
+                hard_neg_input = torch.cat([z_prompt, pred_response.detach()], dim=1)
+                hard_neg_logits = self.relevance_head(hard_neg_input)
+                
                 # Targets
                 pos_target = torch.ones_like(pos_logits)
                 neg_target = torch.zeros_like(neg_logits)
+                hard_neg_target = torch.zeros_like(hard_neg_logits)
                 
                 rel_loss_fct = nn.BCEWithLogitsLoss()
-                rel_loss = (rel_loss_fct(pos_logits, pos_target) + rel_loss_fct(neg_logits, neg_target)) / 2
+                rel_loss = (
+                    rel_loss_fct(pos_logits, pos_target) + 
+                    0.5 * rel_loss_fct(neg_logits, neg_target) +
+                    0.5 * rel_loss_fct(hard_neg_logits, hard_neg_target)
+                ) / 2
                 
                 loss += 0.5 * rel_loss # High weight to enforce relevance
                 result['relevance_loss'] = rel_loss
                 
             result['loss'] = loss
-            result['token_loss'] = token_loss
-            result['stop_loss'] = stop_loss
+            result['token_loss'] = token_loss_per_sample.mean()
+            result['stop_loss'] = stop_loss.mean() if isinstance(stop_loss, torch.Tensor) else stop_loss
             result['answerable_logits'] = answerable_logits
         
         if return_states:
@@ -461,6 +516,7 @@ class RNK(nn.Module):
         temperature: float = 1.0,
         top_k: int = 50,
         top_p: float = 0.9,
+        repetition_penalty: float = 1.0,
         fast_hidden: Optional[torch.Tensor] = None,
         slow_memory: Optional[torch.Tensor] = None,
         prev_intent: Optional[torch.Tensor] = None,
@@ -483,35 +539,45 @@ class RNK(nn.Module):
                 input_ids = torch.cat([input_ids, padding], dim=1)
             
             # Encode and process context (uses padded input for proper chunking)
-            chunk_latents = self.encoder(input_ids)
+            # Also get token embeddings for cross-attention
+            chunk_latents, token_embeddings = self.encoder(input_ids, return_token_embeddings=True)
             ssm_out, fast_hidden, slow_memory = self.ssm(
                 chunk_latents, fast_hidden, slow_memory
             )
             
             # Get intent (global conditioning)
-            global_context = ssm_out.mean(dim=1)
+            # Use Last State to match Training 'split_idx' behavior (State at prompt boundary)
+            global_context = ssm_out[:, -1, :]
             
             if target_intent is not None:
                  cond_idx = target_intent
             else:
                  intent_logits = self.intent_classifier(global_context)
                  cond_idx = intent_logits.argmax(dim=-1)
-                 print(f"DEBUG: Classifier ID: {cond_idx[0].item()}")
-                 
+                 # print(f"DEBUG: Classifier ID: {cond_idx[0].item()}")
+            # intent_vec = torch.zeros(1, 1, self.config.d_model, device=input_ids.device)
             intent_vec = self.intent_embedding(cond_idx).unsqueeze(1)
             
-            # Initial Intent Processing
+            # Selective Boost for Generation
+            scale = torch.ones_like(cond_idx, dtype=torch.float32, device=input_ids.device)
+            scale[cond_idx == 6] = 3.0
+            scale = scale.view(-1, 1, 1)
+            
+            ssm_out = ssm_out + scale * intent_vec # Force Injection (Precision Boost)
+            
+            # Process through HRM (memory + context)
             if self.config.n_planning_steps > 1:
-                intent = self.hrm.forward_with_planning(
+                hrm_out = self.hrm.forward_with_planning(
                     ssm_out, self.config.n_planning_steps
                 )
             else:
-                intent = self.hrm(ssm_out)
+                hrm_out = self.hrm(ssm_out)
 
-            # Apply conditioning (Strong Input Injection)
-            intent = ssm_out + 5.0 * intent_vec
+            # Use pure HRM output - NO intent conditioning
+            # This lets the actual input content drive generation
+            intent = hrm_out
             
-            # Initial Refinement
+            # Refinement
             refined_intent = self.ns_refiner(intent)
             
             # Answerability Gate Check
@@ -557,20 +623,59 @@ class RNK(nn.Module):
         
         # Interpolate (Safe Anchor)
         
-        # Interpolate (Safe Anchor)
-        # Blend the predicted plan with the hard anchor to steer direction
-        # without destroying the manifold (magnitude stays roughly constant)
-        alpha = 0.5
-        boost_vec = self.intent_embedding(best_intent_idx).unsqueeze(1) # (B, 1, D)
-        next_intent = (1 - alpha) * next_intent + alpha * boost_vec
+        # COMPETITIVE GENERATION (The "Brain" Selection)
+        # 1. Expand to K candidates
+        k = 20 # High K to escape Mode Collapse
+        # (B, 1, D) -> (B*k, 1, D)
+        candidates = next_intent.repeat_interleave(k, dim=0) 
         
-        # 3. Generate from Amplified Plan
-        new_tokens = self.decoder.generate_like_training(
+        # 2. Add exploration noise to allow distinct candidates
+        noise = torch.randn_like(candidates) * 0.5 # High Noise to force diversity
+        candidates = candidates + noise
+        
+        # 3. Score with Context Filter (Relevance Head)
+        # NORMALIZE to match training!
+        context_norm = F.normalize(global_context, p=2, dim=1)
+        candidates_norm = F.normalize(candidates.squeeze(1), p=2, dim=1)
+        
+        # Context needs expansion: (B, D) -> (B*k, D)
+        context_expanded = context_norm.repeat_interleave(k, dim=0)
+        
+        # Input: [Context; Candidate]
+        rel_input = torch.cat([context_expanded, candidates_norm], dim=1)
+        scores = self.relevance_head(rel_input).view(input_ids.shape[0], k) # (B, k)
+        
+        # 4. Winner-Take-All
+        best_indices = scores.argmax(dim=1) # (B,)
+        
+        # Select winning vectors
+        # Gather logic: (B, k, D) -> select (B, 1, D) using best_indices
+        candidates_view = candidates.view(input_ids.shape[0], k, -1)
+        next_intent = candidates_view[torch.arange(input_ids.shape[0]), best_indices].unsqueeze(1)
+        
+        print(f"DEBUG: Competitive Selection. Top Score: {scores.max().item():.2f}")
+        
+        # Anchor Polish (Optional: Blend winner with hard intent if needed)
+        # For now, trust the winner
+        
+        # Detecting Intent ID for debugging
+        sims = torch.nn.functional.cosine_similarity(
+             next_intent.squeeze(1), 
+             self.intent_embedding.weight.unsqueeze(0), 
+             dim=-1
+        )
+        best_intent_idx = sims.argmax(dim=-1)
+        print(f"DEBUG: Winner Intent ID: {best_intent_idx[0].item()}")
+        
+        # 3. Generate from Amplified Plan with cross-attention to input
+        new_tokens = self.decoder.generate(
             next_intent,
-            prompt_len=original_input_ids.shape[1],
-            max_new_tokens=max_new_tokens,
+            encoder_output=token_embeddings,  # Cross-attention to input tokens
+            max_len=max_new_tokens,
             temperature=temperature,
-            top_k=top_k
+            top_k=top_k,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty
         )
         
         generated_tokens.append(new_tokens)
