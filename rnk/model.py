@@ -568,12 +568,29 @@ class RNK(nn.Module):
                  # This is a simple check: look for operator-like tokens in the input
                  # Token IDs for common operators/digits (tokenizer-specific, but often in ASCII range)
                  input_flat = input_ids.flatten().tolist()
-                 # Check for presence of math-like patterns: digits 0-9 and operators +-*/=
-                 # ASCII: '+' = 43, '-' = 45, '*' = 42, '/' = 47, '=' = 61, '0'-'9' = 48-57
-                 math_operators = set(range(42, 48))  # *, +, ,, -, ., /
+                 
+                 # IMPORTANT: Only check the LATEST user input, not full history!
+                 # Find the last "User:" marker (bytes: U=85, s=115, e=101, r=114, :=58)
+                 # Then check only bytes after that marker
+                 user_marker = [85, 115, 101, 114, 58]  # "User:"
+                 last_user_pos = -1
+                 for i in range(len(input_flat) - len(user_marker)):
+                     if input_flat[i:i+len(user_marker)] == user_marker:
+                         last_user_pos = i + len(user_marker)
+                 
+                 # Only analyze bytes from the last "User:" marker onwards
+                 if last_user_pos > 0:
+                     recent_input = input_flat[last_user_pos:]
+                 else:
+                     recent_input = input_flat
+                 
+                 # Check for presence of math-like patterns: digits 0-9 and operators +-*/
+                 # ASCII: '+' = 43, '-' = 45, '*' = 42, '/' = 47, '0'-'9' = 48-57
+                 # Note: Exclude comma (44) and period (46) - they're punctuation, not math!
+                 math_operators = {42, 43, 45, 47}  # Only: * + - /
                  digits = set(range(48, 58))  # 0-9
-                 has_operator = any(t in math_operators for t in input_flat)
-                 has_digit = any(t in digits for t in input_flat)
+                 has_operator = any(t in math_operators for t in recent_input)
+                 has_digit = any(t in digits for t in recent_input)
                  
                  if has_operator and has_digit:
                      # Force Math Intent (ID 6)

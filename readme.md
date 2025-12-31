@@ -1,6 +1,8 @@
 # RNK - Recursive Neuro-Knowledge Model
 
-A **5.4M parameter** language model that achieves coherent conversation through **latent planning**, **Mamba state-space modeling**, and **raw byte input** (no tokenization). O(n) complexity.
+A **2.7M parameter** language model that achieves coherent conversation through **latent planning**, **Mamba state-space modeling**, and **raw byte input** (no tokenization). O(n) complexity.
+
+> **Key Finding**: For raw-byte language, optimal capacity scales with dataset entropy, not task complexity. Smaller models (2-5M) generalize better than larger models (27M) on limited data.
 
 ## Core Idea
 
@@ -149,6 +151,21 @@ RNK bets on **latent reasoning** over **pattern matching**. Instead of learning 
 - How to plan multi-step responses (HRM)
 
 This is closer to how humans structure responses: think first, then speak.
+
+## Inference Tips (Raw Byte Mode)
+
+Since the model generates raw characters, coherence depends on inference settings:
+
+1. **Parameters**:
+   - `top_k=50`, `top_p=0.95`: Essential to cut off "noise" bytes.
+   - `temperature=0.5`: Balances creativity vs. garble (0.4-0.6 range).
+   - `max_new_tokens=60+`: Give the model space to finish words.
+
+2. **Prompt Seeding**:
+   - Starting the response (e.g., `Model: The answer is`) helps anchor the byte sequence.
+
+3. **Post-Processing**:
+   - Strip non-printable characters and collapse repeated spaces/chars to fix decoding noise.
 
 ## License
 

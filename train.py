@@ -502,7 +502,18 @@ class Trainer:
     
     def _create_model(self) -> RNK:
         """Create model based on size config."""
-        if self.config.model_size == "small":
+        if self.config.model_size == "tiny":
+            # ~3M params: Test if smaller models grok better on raw bytes
+            config = RNKConfig(
+                vocab_size=256,           # Raw bytes
+                d_model=192,              # Adjusted for ~3M target
+                d_hidden=384,             # 2x d_model
+                n_hrm_layers=2,           # Minimal reasoning
+                n_fast_layers=2,          # Minimal state
+                n_memory_slots=8,         # Minimal memory
+                n_decoder_layers=2        # Minimal decoder
+            )
+        elif self.config.model_size == "small":
             config = RNKConfig(
                 vocab_size=len(self.tokenizer) or 2048,
                 d_model=192,
@@ -532,15 +543,15 @@ class Trainer:
                 n_decoder_layers=3,   
                 chunk_size=32
             )
-        else:  # base
+        else:  # base - Scaled up for Raw Bytes (~15M params)
             config = RNKConfig(
                 vocab_size=len(self.tokenizer) or 2048,
-                d_model=256,
-                d_hidden=512,
-                n_hrm_layers=3,
-                n_fast_layers=3,  # Increased
-                n_memory_slots=16, # Increased
-                n_decoder_layers=2
+                d_model=512,          # Doubled capacity
+                d_hidden=1024,        # Doubled capacity
+                n_hrm_layers=4,       # Deeper reasoning
+                n_fast_layers=4,      # More state capacity
+                n_memory_slots=32,    # More memory slots
+                n_decoder_layers=4    # Deeper decoder for coherence
             )
         
         return RNK(config)
@@ -738,6 +749,7 @@ class Trainer:
         }
         
         path = os.path.join(self.config.checkpoint_dir, f'rnk_epoch_{epoch+1}.pt')
+        os.makedirs(self.config.checkpoint_dir, exist_ok=True)  # Create dir if deleted
         torch.save(checkpoint, path)
         
         # Save best model
@@ -824,7 +836,7 @@ def main():
     parser = argparse.ArgumentParser(description="Train RNK model")
     parser.add_argument("--train", type=str, default="data/train.txt", help="Training data path")
     parser.add_argument("--val", type=str, default=None, help="Validation data path")
-    parser.add_argument("--size", type=str, default="base", choices=["small", "base", "large", "xl"])
+    parser.add_argument("--size", type=str, default="base", choices=["tiny", "small", "base", "large", "xl"])
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch", type=int, default=512)
     parser.add_argument("--lr", type=float, default=3e-4)

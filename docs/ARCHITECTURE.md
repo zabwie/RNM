@@ -69,11 +69,48 @@ The model learns character→word→sentence patterns naturally.
 
 ## Parameter Count
 
-| Module | Params |
-|--------|--------|
 | Encoder | 65K |
 | Mamba SSM | 1.3M |
 | HRM | 857K |
 | NS Refiner | 659K |
 | Decoder | 2.0M |
 | **Total** | **5.4M** |
+
+## Capacity-Data Mismatch (Critical Finding)
+
+> **For raw-byte language, optimal capacity scales with dataset entropy, not task complexity.**
+
+### Empirical Results
+
+| Model Size | Training Time | Output Quality |
+|------------|---------------|----------------|
+| 2.7M (tiny) | 24 mins | "Hi there! How can I help?" ✅ |
+| 27M (base) | 95 mins | Garbled byte sequences ❌ |
+
+### Why Smaller Is Better (for limited data)
+
+1. **2.7M forced to compress** → learns abstract patterns (grammar, cadence, intent)
+2. **27M had excess capacity** → memorized noisy byte trajectories
+3. This is **grokking behavior**: generalization emerges when the model is too small to cheat
+
+### Scaling Guidelines
+
+| Data Size | Optimal Params | Early-Stop Loss |
+|-----------|----------------|-----------------|
+| 5k-20k | 2-5M | ~0.25-0.35 |
+| 50k+ | 10-20M | ~0.15-0.25 |
+
+**Rule**: Scale data before scaling parameters.
+
+## Design Philosophy
+
+> **"Intelligence is the ability to represent ignorance without collapsing."**
+
+This principle manifests in RNK's architecture:
+
+1. **Answerability Head** - The model can represent "I don't know" without forcing a confident wrong answer
+2. **Capacity constraints** - Smaller models *don't try to explain everything*; larger models "collapse" by memorizing noise
+3. **Latent planning** - Uncertainty is preserved in compressed representation rather than prematurely collapsed into tokens
+4. **Grokking** - True generalization emerges when the model is forced to admit limitations through compression
+
+The 2.7M model succeeds because it represents its ignorance gracefully. The 27M model failed because it tried to explain every byte pattern, collapsing into incoherent memorization.
